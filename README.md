@@ -97,48 +97,43 @@ For a clear first-time targeted aggression case, ModGuard can issue a visible wa
 
 ## Live Demos
 
-GitHub autoplay GIFs are used here for faster scanning. Each preview loops automatically.  
-Click any GIF to open the original MP4 clip.
+The demos below autoplay and loop directly inside the README.
 
 ### Project Overview
-[![Project Overview](assets/demo/gifs/01-project-overview.gif)](assets/demo/01-project-overview.mp4)
+![Project Overview](assets/demo/gifs/01-project-overview.gif)
 
 Architecture, safety model, product tour and regression coverage.
 
 ### Control Center
-[![Control Center](assets/demo/gifs/02-control-center.gif)](assets/demo/02-control-center.mp4)
+![Control Center](assets/demo/gifs/02-control-center.gif)
 
 Per-community dashboard and moderation controls.
 
 ### Live Enforcement
-[![Live Enforcement](assets/demo/gifs/03-live-enforcement.gif)](assets/demo/03-live-enforcement.mp4)
+![Live Enforcement](assets/demo/gifs/03-live-enforcement.gif)
 
 Real moderation actions and ban-management workflow.
 
 ### Human Review
-[![Human Review](assets/demo/gifs/04-human-review.gif)](assets/demo/04-human-review.mp4)
+![Human Review](assets/demo/gifs/04-human-review.gif)
 
 Ambiguous conflict escalates with conversation context.
 
 ### Community Policy
-[![Community Policy](assets/demo/gifs/05-community-policy.gif)](assets/demo/05-community-policy.mp4)
+![Community Policy](assets/demo/gifs/05-community-policy.gif)
 
 Natural-language community rules compiled into structured enforcement.
 
 ### System Diagnostics
-[![System Diagnostics](assets/demo/gifs/06-system-diagnostics.gif)](assets/demo/06-system-diagnostics.mp4)
+![System Diagnostics](assets/demo/gifs/06-system-diagnostics.gif)
 
 Telegram, database, Ollama, LLM and embedding health checks.
 
 ### Safe Test Mode
-[![Safe Test Mode](assets/demo/gifs/07-safe-test-mode.gif)](assets/demo/07-safe-test-mode.mp4)
+![Safe Test Mode](assets/demo/gifs/07-safe-test-mode.gif)
 
 Safe simulations for critical moderation actions.
 
-### Full Live Walkthrough
-[▶ Watch the full continuous ModGuard v1.0.0 demo](ModGuard_v1.0.0_Live_Demo.mp4)
-
-All seven clips stitched in order as one continuous walkthrough.
 
 ---
 
