@@ -18,6 +18,7 @@ from app.admin.control_models import (
     CommunityPolicyDraftRecord,
     CommunityPolicyVersionRecord,
     KnownModerationPatternRecord,
+    ManagedChatTombstoneRecord,
     ModerationTicketRecord,
     ModeratorFeedbackRecord,
     ModerationBanRecord,
@@ -121,6 +122,13 @@ class ControlRepository:
                     if chat_title:
                         alias.chat_title = chat_title
                     alias.updated_at = utcnow()
+
+                # A confirmed migration proves that the canonical target exists.
+                await session.execute(
+                    delete(ManagedChatTombstoneRecord).where(
+                        ManagedChatTombstoneRecord.chat_id == new_chat_id
+                    )
+                )
 
                 # Any older aliases in a chain should point directly at canonical.
                 await session.execute(
@@ -279,6 +287,14 @@ class ControlRepository:
                     current = aliases[current]
                 return current
 
+            tombstone_result = await session.execute(
+                select(ManagedChatTombstoneRecord.chat_id)
+            )
+            unavailable_chat_ids = {
+                int(chat_id)
+                for chat_id in tombstone_result.scalars().all()
+            }
+
             settings_result = await session.execute(
                 select(ChatControlSettingsRecord.chat_id, ChatControlSettingsRecord.chat_title)
             )
@@ -289,9 +305,13 @@ class ControlRepository:
             merged: dict[int, str] = {}
             for chat_id, title in message_result.all():
                 target = canonical(int(chat_id))
+                if target in unavailable_chat_ids:
+                    continue
                 merged[target] = title or merged.get(target) or str(target)
             for chat_id, title in settings_result.all():
                 target = canonical(int(chat_id))
+                if target in unavailable_chat_ids:
+                    continue
                 merged[target] = title or merged.get(target) or str(target)
 
             return [
@@ -300,6 +320,50 @@ class ControlRepository:
                     merged.items(), key=lambda item: (item[1].casefold(), item[0])
                 )
             ]
+
+    async def mark_chat_unavailable(
+        self,
+        *,
+        chat_id: int,
+        reason: str,
+    ) -> None:
+        """Hide an inaccessible chat from Change chat while preserving history."""
+        chat_id = int(chat_id)
+        safe_reason = (reason or "Telegram chat unavailable").strip()[:255]
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                record = await session.get(ManagedChatTombstoneRecord, chat_id)
+                if record is None:
+                    session.add(
+                        ManagedChatTombstoneRecord(
+                            chat_id=chat_id,
+                            reason=safe_reason,
+                        )
+                    )
+                else:
+                    record.reason = safe_reason
+                    record.updated_at = utcnow()
+
+                await session.execute(
+                    update(AdminDashboardStateRecord)
+                    .where(AdminDashboardStateRecord.selected_chat_id == chat_id)
+                    .values(selected_chat_id=None, updated_at=utcnow())
+                )
+
+    async def mark_chat_available(
+        self,
+        *,
+        chat_id: int,
+    ) -> None:
+        """Revive a chat after Telegram proves that this exact id is active again."""
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(ManagedChatTombstoneRecord).where(
+                        ManagedChatTombstoneRecord.chat_id == int(chat_id)
+                    )
+                )
 
     async def ensure_chat_settings(
         self, *, chat_id: int, chat_title: str | None = None

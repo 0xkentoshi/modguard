@@ -4,11 +4,11 @@
 
 ### Local-first AI moderation agent for Telegram communities
 
-![Version](https://img.shields.io/badge/version-1.0.0-111111)
+![Version](https://img.shields.io/badge/version-1.0.1-111111)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-aiogram-26A5E4?logo=telegram&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-Ollama-black)
-![Tests](https://img.shields.io/badge/regression_tests-200%2B-success)
+![Tests](https://img.shields.io/badge/regression_tests-217-success)
 
 **Real moderation actions · Local LLMs · Deterministic safety · Human review**
 
@@ -153,9 +153,12 @@ Safe simulations for critical moderation actions.
 - **Known Pattern Memory** for repeated confirmed malicious payloads
 - **Multi-community isolation** with independent settings and policies
 - **Telegram group → supergroup migration recovery**
+- **Stale-chat lifecycle cleanup** when the bot leaves or is removed
+- **Per-user multi-party conflict state** for fair first-offense handling
+- **Graceful Ctrl+C shutdown** with isolated resource cleanup
 - **Ban registry** with newest-first pagination, search and unban
 - **Diagnostics** for Telegram, database, Ollama, Fast/Deep LLMs and embeddings
-- **200+ automated regression tests**
+- **217 automated regression tests**
 
 ---
 
@@ -403,7 +406,7 @@ Key engineering problems addressed:
 
 ## Version
 
-**ModGuard v1.0.0 — Portfolio Release**
+**ModGuard v1.0.1 — Portfolio Release**
 
 The moderation core is treated as a frozen baseline for the portfolio version. Future work will focus primarily on deployment, operational tooling and commercial pilot infrastructure rather than changing the tested moderation behavior.
 

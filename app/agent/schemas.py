@@ -166,6 +166,12 @@ class ModerationDecision(BaseModel):
 
     needs_human_review: bool = False
 
+    conflict_context: Literal[
+        "not_applicable",
+        "clear_current_aggressor",
+        "ambiguous_multi_party",
+    ] = "not_applicable"
+
     reason: str = Field(
         min_length=1,
         max_length=800,

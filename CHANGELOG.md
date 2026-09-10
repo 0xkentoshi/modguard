@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.0.1] - 2026-09-11
+
+### Fixed
+
+- stale or inaccessible Telegram chats are hidden from `Change chat` without deleting moderation history
+- chats automatically become available again when ModGuard is re-added
+- basic-group → supergroup migration reconciliation remains preserved
+- multi-party harassment state is evaluated per `chat_id + user_id`
+- each participant can receive an independent first-offense warning
+- repeated aggression by the same participant escalates to human review
+- ambiguous multi-party conflicts remain conservative and go to a moderator ticket
+- Ctrl+C shutdown now closes Telegram, LLM providers, semantic services and the database without noisy traceback chains
+
+### Validation
+
+- full local regression suite: **217 tests**
+- live QA passed for stale-chat removal / re-add
+- live QA passed for multi-user fight fairness
+- live QA passed for graceful shutdown
+
+### Notes
+
+`v1.0.1` is a post-portfolio live-QA stabilization release. The core moderation architecture and enforcement surface remain unchanged.
+
 All notable portfolio-release changes are documented here.
 
 ## [1.0.0] - 2026-09-10

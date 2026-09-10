@@ -112,6 +112,24 @@ async def telegram_get_me_with_retry(
 
 
 
+async def _close_component_quietly(
+    label: str,
+    close_call,
+) -> None:
+    """Best-effort shutdown: one cancelled closer must not block the rest."""
+    try:
+        await close_call()
+    except asyncio.CancelledError:
+        logging.debug("%s cleanup cancelled during shutdown", label)
+    except Exception as exc:
+        logging.warning(
+            "%s cleanup failed during shutdown | %s: %s",
+            label,
+            type(exc).__name__,
+            exc,
+        )
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -540,19 +558,82 @@ async def main() -> None:
         )
 
     finally:
-        # get_me() may fail before polling ever starts. Cleanup must still run.
+        telegram_session_label = "Telegram session"
+        database_label = "Database"
+
+        # Keep explicit awaits for the startup-resilience contract while isolating
+        # every closer so one cancelled/failed cleanup cannot block the rest.
         try:
             await bot.session.close()
-        except Exception:
-            logging.exception(
-                "Telegram session cleanup failed"
+        except asyncio.CancelledError:
+            logging.debug("%s cleanup cancelled during shutdown", telegram_session_label)
+        except Exception as exc:
+            logging.warning(
+                "%s cleanup failed during shutdown | %s: %s",
+                telegram_session_label,
+                type(exc).__name__,
+                exc,
             )
 
-        await semantic_cluster_service.close()
-        await fast_provider.close()
-        await deep_provider.close()
-        await policy_compiler_provider.close()
-        await database.dispose()
+        await _close_component_quietly(
+            "Semantic cluster service",
+            semantic_cluster_service.close,
+        )
+
+        try:
+            await fast_provider.close()
+        except asyncio.CancelledError:
+            logging.debug("Fast LLM provider cleanup cancelled during shutdown")
+        except Exception as exc:
+            logging.warning(
+                "Fast LLM provider cleanup failed during shutdown | %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+        try:
+            await deep_provider.close()
+        except asyncio.CancelledError:
+            logging.debug("Deep LLM provider cleanup cancelled during shutdown")
+        except Exception as exc:
+            logging.warning(
+                "Deep LLM provider cleanup failed during shutdown | %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+        try:
+            await policy_compiler_provider.close()
+        except asyncio.CancelledError:
+            logging.debug(
+                "Policy compiler provider cleanup cancelled during shutdown"
+            )
+        except Exception as exc:
+            logging.warning(
+                "Policy compiler provider cleanup failed during shutdown | %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+        try:
+            await database.dispose()
+        except asyncio.CancelledError:
+            logging.debug("%s cleanup cancelled during shutdown", database_label)
+        except Exception as exc:
+            logging.warning(
+                "%s cleanup failed during shutdown | %s: %s",
+                database_label,
+                type(exc).__name__,
+                exc,
+            )
+
+
+def run_main() -> None:
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nModGuard stopped.")
+
+
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    run_main()

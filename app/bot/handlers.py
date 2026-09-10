@@ -500,12 +500,28 @@ async def register_managed_chat(
 
     status = event.new_chat_member.status
     if status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
+        await control_repository.mark_chat_available(
+            chat_id=event.chat.id,
+        )
         await control_repository.ensure_chat_settings(
             chat_id=event.chat.id,
             chat_title=event.chat.title,
         )
         logger.info(
             "MANAGED CHAT REGISTERED | chat=%s | title=%s | status=%s",
+            event.chat.id,
+            event.chat.title,
+            getattr(status, "value", status),
+        )
+        return
+
+    if status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}:
+        await control_repository.mark_chat_unavailable(
+            chat_id=event.chat.id,
+            reason=f"my_chat_member status={getattr(status, 'value', status)}",
+        )
+        logger.info(
+            "MANAGED CHAT UNAVAILABLE | chat=%s | title=%s | status=%s",
             event.chat.id,
             event.chat.title,
             getattr(status, "value", status),

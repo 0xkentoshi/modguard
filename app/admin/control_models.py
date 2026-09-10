@@ -44,6 +44,22 @@ class ChatMigrationRecord(Base):
     )
 
 
+class ManagedChatTombstoneRecord(Base):
+    """
+    Marks a previously managed Telegram chat as unavailable without deleting
+    moderation history, tickets, bans, policies, or audit data.
+    """
+
+    __tablename__ = "managed_chat_tombstones"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    reason: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
 class ChatEnforcementSettingsRecord(Base):
     """
     Destructive live-action switches kept in a separate table.

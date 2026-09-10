@@ -324,6 +324,50 @@ class PolicyGate:
                     "Evidence gate: destructive action lacks current-message evidence.",
                 )
 
+        # Structured per-user conflict semantics prevents one participant's
+        # warning from affecting another participant's first clear offense.
+        if (
+            decision.category == "harassment"
+            and decision.conflict_context == "clear_current_aggressor"
+        ):
+            history = self._history_actions(
+                context,
+                categories={"harassment"},
+            )
+            if any(
+                action_name in {"warn", "delete", "mute", "ban"}
+                for action_name in history
+            ):
+                return self._escalate(
+                    decision,
+                    "Repeated harassment by this user in this chat → moderator Ticket.",
+                )
+            if (
+                decision.confidence >= LIGHT_HARASSMENT_CONFIDENCE
+                and decision.severity in {"medium", "high", "critical"}
+            ):
+                return PolicyEvaluation(
+                    original_action=decision.action,
+                    final_action="warn",
+                    final_delete_message=False,
+                    final_mute_minutes=None,
+                    autonomous=True,
+                    requires_human_review=False,
+                    policy_reason=(
+                        "Per-user conflict boundary: this user's first clear targeted "
+                        "harassment in this chat → WARN."
+                    ),
+                )
+
+        if (
+            decision.category == "harassment"
+            and decision.conflict_context == "ambiguous_multi_party"
+        ):
+            return self._escalate(
+                decision,
+                "Human-conflict role is ambiguous → moderator Ticket.",
+            )
+
         # Genuine uncertainty always becomes a moderator Ticket. This is
         # especially important for multi-party fights where the instigator is
         # unclear from one message.

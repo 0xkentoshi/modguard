@@ -18,12 +18,18 @@ class FakeRepo:
     async def list_managed_chats(self):
         return [
             ManagedChat(chat_id=-123456789, title="Sandbox 4"),
-            ManagedChat(chat_id=-1001234567890, title="Sandbox 4"),
+            ManagedChat(chat_id=-1004432432239, title="Sandbox 4"),
         ]
 
     async def register_chat_migration(self, *, old_chat_id, new_chat_id, chat_title=None):
         self.registered.append((old_chat_id, new_chat_id, chat_title))
         return new_chat_id
+
+    async def mark_chat_available(self, *, chat_id):
+        return None
+
+    async def mark_chat_unavailable(self, *, chat_id, reason):
+        return None
 
     async def ensure_chat_settings(self, *, chat_id, chat_title=None):
         self.titles.append((chat_id, chat_title))
@@ -37,7 +43,7 @@ class FakeChat:
 class FakeBot:
     async def get_chat_member_count(self, chat_id):
         if chat_id == -123456789:
-            raise FakeMigration(-1001234567890)
+            raise FakeMigration(-1004432432239)
         return 3
 
     async def get_chat(self, chat_id):
@@ -61,5 +67,5 @@ async def test_reconcile_uses_passive_member_count_probe_when_getchat_would_not_
 
     assert repaired == 1
     assert repo.registered == [
-        (-123456789, -1001234567890, "Sandbox 4")
+        (-123456789, -1004432432239, "Sandbox 4")
     ]

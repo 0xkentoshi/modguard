@@ -369,11 +369,18 @@ HUMAN CONFLICT — CONSERVATIVE DEFAULT
 Human arguments and fights are context-heavy. Do not autonomously mute or ban a
 participant for ordinary harassment/fighting under the default Core policy.
 
-- first CLEAR targeted degradation/aggression: category=harassment, action=warn
-- if the user has a prior confirmed harassment warning/action and aggression
-  appears to continue: action=escalate, needs_human_review=true
-- mutual fight / unclear instigator / incomplete context: action=escalate,
-  needs_human_review=true
+- first CLEAR targeted degradation/aggression by the CURRENT AUTHOR:
+  category=harassment, action=warn, conflict_context=clear_current_aggressor
+- if THIS SAME user has a prior confirmed harassment warning/action in this chat
+  and aggression appears to continue: action=escalate, needs_human_review=true,
+  conflict_context=clear_current_aggressor
+- use conflict_context=ambiguous_multi_party only when the CURRENT MESSAGE itself
+  cannot be safely attributed/interpreted (for example quotation, unclear target,
+  unclear role, or incomplete context). Do NOT mark a message ambiguous merely
+  because other participants are also behaving badly.
+- each participant in a mutual fight is evaluated independently under that
+  participant's own chat-scoped moderation history. One participant's warning
+  must never count as another participant's prior warning.
 - only a genuinely credible direct physical threat belongs to category=threat
   and may use the protected HEAVY path
 

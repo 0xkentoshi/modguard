@@ -7,7 +7,12 @@ import os
 import aiohttp
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramMigrateToChat
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+)
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.admin.control_repository import ControlRepository
@@ -49,6 +54,25 @@ def is_not_modified_error(exc: Exception) -> bool:
     return "message is not modified" in str(exc).lower()
 
 
+def is_definitively_unavailable_chat_error(exc: Exception) -> bool:
+    """Classify only definitive Telegram chat-removal responses as stale."""
+    if isinstance(exc, TelegramForbiddenError):
+        return True
+    if not isinstance(exc, TelegramBadRequest):
+        return False
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "chat not found",
+            "bot was kicked",
+            "bot is not a member",
+            "group chat was deleted",
+            "supergroup chat was deleted",
+        )
+    )
+
+
 def is_missing_edit_target(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
@@ -80,14 +104,20 @@ class DashboardService:
         self._registry_reconcile_lock = asyncio.Lock()
 
     async def reconcile_managed_chats(self, *, force: bool = False) -> int:
-        """Discover Telegram basic-group -> supergroup migrations and merge stale aliases."""
+        """
+        Repair basic-group migrations and hide definitively unavailable chats.
+        Historical moderation data is retained.
+        """
         if self._registry_reconciled and not force:
             return 0
+
         async with self._registry_reconcile_lock:
             if self._registry_reconciled and not force:
                 return 0
+
             repaired = 0
             chats = await self.repository.list_managed_chats()
+
             async def repair_alias(chat, exc: TelegramMigrateToChat) -> None:
                 nonlocal repaired
                 new_id = int(exc.migrate_to_chat_id)
@@ -98,8 +128,11 @@ class DashboardService:
                 except Exception:
                     logger.debug(
                         "Could not refresh migrated chat title | old=%s | new=%s",
-                        chat.chat_id, new_id, exc_info=True,
+                        chat.chat_id,
+                        new_id,
+                        exc_info=True,
                     )
+
                 await self.repository.register_chat_migration(
                     old_chat_id=chat.chat_id,
                     new_chat_id=new_id,
@@ -108,54 +141,87 @@ class DashboardService:
                 repaired += 1
                 logger.info(
                     "CHAT MIGRATION REPAIRED | old=%s | new=%s | title=%s",
-                    chat.chat_id, new_id, title,
+                    chat.chat_id,
+                    new_id,
+                    title,
+                )
+
+            async def mark_unavailable(chat, reason: str) -> None:
+                await self.repository.mark_chat_unavailable(
+                    chat_id=chat.chat_id,
+                    reason=reason,
+                )
+                logger.info(
+                    "STALE MANAGED CHAT HIDDEN | chat=%s | title=%s | reason=%s",
+                    chat.chat_id,
+                    chat.title,
+                    compact(reason, 160),
                 )
 
             for chat in chats:
-                # Supergroups already use the canonical -100... id. Only old/basic
-                # ids need migration discovery.
-                if str(chat.chat_id).startswith("-100"):
-                    continue
-
-                # Important: getChat can still succeed for an obsolete basic-group
-                # id after Telegram upgraded it. getChatMemberCount is a passive,
-                # side-effect-free probe that returns migrate_to_chat_id for such
-                # stale ids, so use it before trusting getChat.
-                try:
-                    await self.bot.get_chat_member_count(chat.chat_id)
-                except TelegramMigrateToChat as exc:
-                    await repair_alias(chat, exc)
-                    continue
-                except TelegramBadRequest as exc:
-                    logger.info(
-                        "CHAT MIGRATION PROBE SKIPPED | chat=%s | reason=%s",
-                        chat.chat_id, compact(str(exc), 160),
-                    )
-                except TelegramAPIError as exc:
-                    logger.warning(
-                        "CHAT MIGRATION PROBE FAILED | chat=%s | reason=%s",
-                        chat.chat_id, compact(str(exc), 160),
-                    )
+                if not str(chat.chat_id).startswith("-100"):
+                    try:
+                        await self.bot.get_chat_member_count(chat.chat_id)
+                    except TelegramMigrateToChat as exc:
+                        await repair_alias(chat, exc)
+                        continue
+                    except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                        if is_definitively_unavailable_chat_error(exc):
+                            await mark_unavailable(chat, str(exc))
+                            continue
+                        logger.info(
+                            "CHAT MIGRATION PROBE SKIPPED | chat=%s | reason=%s",
+                            chat.chat_id,
+                            compact(str(exc), 160),
+                        )
+                    except TelegramAPIError as exc:
+                        logger.warning(
+                            "CHAT MIGRATION PROBE FAILED | chat=%s | reason=%s",
+                            chat.chat_id,
+                            compact(str(exc), 160),
+                        )
 
                 try:
                     telegram_chat = await self.bot.get_chat(chat.chat_id)
                     title = getattr(telegram_chat, "title", None)
-                    if title:
-                        await self.repository.ensure_chat_settings(
-                            chat_id=chat.chat_id, chat_title=title
-                        )
+
+                    get_member = getattr(self.bot, "get_chat_member", None)
+                    if callable(get_member):
+                        member = await get_member(chat.chat_id, self.bot.id)
+                        status = getattr(member, "status", "")
+                        status = str(getattr(status, "value", status)).casefold()
+                        if status in {"left", "kicked"}:
+                            await mark_unavailable(
+                                chat,
+                                f"bot membership status={status}",
+                            )
+                            continue
+
+                    await self.repository.mark_chat_available(
+                        chat_id=chat.chat_id,
+                    )
+                    await self.repository.ensure_chat_settings(
+                        chat_id=chat.chat_id,
+                        chat_title=title or chat.title,
+                    )
                 except TelegramMigrateToChat as exc:
                     await repair_alias(chat, exc)
-                except TelegramBadRequest as exc:
-                    logger.info(
-                        "CHAT REGISTRY PROBE SKIPPED | chat=%s | reason=%s",
-                        chat.chat_id, compact(str(exc), 160),
-                    )
+                except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                    if is_definitively_unavailable_chat_error(exc):
+                        await mark_unavailable(chat, str(exc))
+                    else:
+                        logger.info(
+                            "CHAT REGISTRY PROBE SKIPPED | chat=%s | reason=%s",
+                            chat.chat_id,
+                            compact(str(exc), 160),
+                        )
                 except TelegramAPIError as exc:
                     logger.warning(
                         "CHAT REGISTRY PROBE FAILED | chat=%s | reason=%s",
-                        chat.chat_id, compact(str(exc), 160),
+                        chat.chat_id,
+                        compact(str(exc), 160),
                     )
+
             self._registry_reconciled = True
             return repaired
 
