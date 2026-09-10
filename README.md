@@ -1,4 +1,6 @@
-# ModGuard
+<div align="center">
+
+# 🛡️ ModGuard
 
 ### Local-first AI moderation agent for Telegram communities
 
@@ -8,13 +10,88 @@
 ![LLM](https://img.shields.io/badge/LLM-Ollama-black)
 ![Tests](https://img.shields.io/badge/regression_tests-200%2B-success)
 
-**ModGuard** is a production-oriented moderation agent that combines local LLM reasoning with deterministic safety controls. It analyzes Telegram messages, executes moderation actions, detects coordinated campaigns, and escalates ambiguous human conflicts to a moderator instead of making unsafe guesses.
+**Real moderation actions · Local LLMs · Deterministic safety · Human review**
 
-The core design principle is simple:
+</div>
+
+**ModGuard** is a production-oriented moderation agent that combines local LLM reasoning with deterministic safety controls. It analyzes Telegram messages, executes real moderation actions, detects coordinated campaigns, and escalates ambiguous human conflicts to a moderator instead of making unsafe guesses.
 
 > **LLM reasoning → structured decision → deterministic policy → controlled execution**
 
-ModGuard is not a keyword blacklist and not a chatbot that only gives advice. It performs real moderation actions while keeping destructive decisions behind explicit policy gates.
+ModGuard is not a keyword blacklist and not a chatbot that only gives advice. The model interprets behavior; deterministic code decides what is safe to execute.
+
+---
+
+## Product Tour
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### Control Center
+
+Per-community dashboard with live statistics, tickets, settings, Test Mode and multi-chat management.
+
+<img src="assets/screenshots/01-dashboard.png" alt="ModGuard admin dashboard" width="100%">
+
+</td>
+<td width="50%" valign="top">
+
+### Ban Management
+
+Real ban state with newest-first ordering, search and one-click unban.
+
+<img src="assets/screenshots/02-ban-management.png" alt="ModGuard banned users management" width="100%">
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### Human Review
+
+Ambiguous interpersonal conflicts become review tickets with the surrounding conversation instead of blind autonomous punishment.
+
+<img src="assets/screenshots/03-human-review-ticket.png" alt="ModGuard human review ticket with conversation context" width="100%">
+
+</td>
+<td width="50%" valign="top">
+
+### Natural-language Policy
+
+Administrators describe community rules in normal language; ModGuard compiles them into structured enforcement rules.
+
+<img src="assets/screenshots/04-community-policy.png" alt="ModGuard natural-language community policy preview" width="100%">
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### System Diagnostics
+
+Telegram, permissions, database, Ollama, Fast/Deep LLMs, embeddings and chat-registry health are checked from the admin interface.
+
+<img src="assets/screenshots/05-diagnostics.png" alt="ModGuard system diagnostics" width="100%">
+
+</td>
+<td width="50%" valign="top">
+
+### Safe Test Mode
+
+Critical actions can be simulated before enabling them in a real community.
+
+<img src="assets/screenshots/06-test-mode.png" alt="ModGuard safe test mode" width="100%">
+
+</td>
+</tr>
+</table>
+
+### Context-aware moderation in action
+
+A real conversation can contain profanity, replies and escalating aggression. ModGuard keeps the conversation context available for the moderation pipeline instead of reducing decisions to isolated keywords.
+
+<img src="assets/screenshots/07-live-conflict.png" alt="Telegram conflict conversation used by ModGuard context-aware moderation" width="760">
 
 ---
 
