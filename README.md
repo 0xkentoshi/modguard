@@ -87,11 +87,11 @@ Critical actions can be simulated before enabling them in a real community.
 </tr>
 </table>
 
-### Context-aware moderation in action
+### Real warning enforcement
 
-A real conversation can contain profanity, replies and escalating aggression. ModGuard keeps the conversation context available for the moderation pipeline instead of reducing decisions to isolated keywords.
+For a clear first-time targeted aggression case, ModGuard can issue a visible warning while leaving the triggering message in place. Repeated or ambiguous conflict is handled more conservatively and can be escalated to human review.
 
-<img src="assets/screenshots/07-live-conflict.png" alt="Telegram conflict conversation used by ModGuard context-aware moderation" width="760">
+<img src="assets/screenshots/07-real-warning.png" alt="ModGuard real warning for targeted aggression" width="760">
 
 ---
 
