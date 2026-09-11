@@ -428,7 +428,7 @@ Current public release focused on real-world pilot safety:
 - Automatic per-community Safety Circuit Breaker
 - Configurable reputation decay for minor offenses
 - Cleaner separation between everyday Settings and Safety & Tools
-- Expanded public regression coverage: **255 tests**
+- Expanded public regression coverage: **253 tests**
 
 ### v1.0.1 — Portfolio Release
 
