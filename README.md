@@ -1,429 +1,330 @@
-<div align="center">
+# ModGuard
 
-# 🛡️ ModGuard
+**Context-aware AI moderation agent for Telegram communities.**
 
-### Local-first AI moderation agent for Telegram communities
+ModGuard combines local LLM reasoning, deterministic moderation policies, community-specific rules and human-controlled enforcement to detect spam, scams, raids, impersonation and abusive behavior without turning moderation into a black box.
 
-![Version](https://img.shields.io/badge/version-1.0.1-111111)
-![Python](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)
-![Telegram](https://img.shields.io/badge/Telegram-aiogram-26A5E4?logo=telegram&logoColor=white)
-![LLM](https://img.shields.io/badge/LLM-Ollama-black)
-![Tests](https://img.shields.io/badge/regression_tests-217-success)
-
-**Real moderation actions · Local LLMs · Deterministic safety · Human review**
-
-</div>
-
-**ModGuard** is a production-oriented moderation agent that combines local LLM reasoning with deterministic safety controls. It analyzes Telegram messages, executes real moderation actions, detects coordinated campaigns, and escalates ambiguous human conflicts to a moderator instead of making unsafe guesses.
-
-> **LLM reasoning → structured decision → deterministic policy → controlled execution**
-
-ModGuard is not a keyword blacklist and not a chatbot that only gives advice. The model interprets behavior; deterministic code decides what is safe to execute.
+> **Current public release:** `v1.2.0 — Safety & Identity Protection`
 
 ---
 
-## Product Tour
+## Why ModGuard
 
-<table>
-<tr>
-<td width="50%" valign="top">
+Classic moderation bots are strong at fixed rules: banned words, flood limits, links and simple filters. They become much weaker when the decision depends on **intent, context, history or impersonation**.
 
-### Control Center
+ModGuard is designed for cases such as:
 
-Per-community dashboard with live statistics, tickets, settings, Test Mode and multi-chat management.
+- hidden advertising without obvious keywords;
+- scam messages written in natural language;
+- repeated harassment that only becomes clear from conversation history;
+- raid or coordinated spam behavior;
+- fake admins / fake moderators impersonating trusted staff;
+- community-specific rules that cannot be expressed as a single regex.
 
-<img src="assets/screenshots/01-dashboard.png" alt="ModGuard admin dashboard" width="100%">
-
-</td>
-<td width="50%" valign="top">
-
-### Ban Management
-
-Real ban state with newest-first ordering, search and one-click unban.
-
-<img src="assets/screenshots/02-ban-management.png" alt="ModGuard banned users management" width="100%">
-
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-
-### Human Review
-
-Ambiguous interpersonal conflicts become review tickets with the surrounding conversation instead of blind autonomous punishment.
-
-<img src="assets/screenshots/03-human-review-ticket.png" alt="ModGuard human review ticket with conversation context" width="100%">
-
-</td>
-<td width="50%" valign="top">
-
-### Natural-language Policy
-
-Administrators describe community rules in normal language; ModGuard compiles them into structured enforcement rules.
-
-<img src="assets/screenshots/04-community-policy.png" alt="ModGuard natural-language community policy preview" width="100%">
-
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-
-### System Diagnostics
-
-Telegram, permissions, database, Ollama, Fast/Deep LLMs, embeddings and chat-registry health are checked from the admin interface.
-
-<img src="assets/screenshots/05-diagnostics.png" alt="ModGuard system diagnostics" width="100%">
-
-</td>
-<td width="50%" valign="top">
-
-### Safe Test Mode
-
-Critical actions can be simulated before enabling them in a real community.
-
-<img src="assets/screenshots/06-test-mode.png" alt="ModGuard safe test mode" width="100%">
-
-</td>
-</tr>
-</table>
-
-### Real warning enforcement
-
-For a clear first-time targeted aggression case, ModGuard can issue a visible warning while leaving the triggering message in place. Repeated or ambiguous conflict is handled more conservatively and can be escalated to human review.
-
-<img src="assets/screenshots/07-real-warning.png" alt="ModGuard real warning for targeted aggression" width="760">
+The AI does not act alone. Decisions pass through a policy and safety layer before enforcement.
 
 ---
 
-## Live Demos
+## How it works
 
-The demos below autoplay and loop directly inside the README.
-
-### Project Overview
-![Project Overview](assets/demo/gifs/01-project-overview.gif)
-
-Architecture, safety model, product tour and regression coverage.
-
-### Control Center
-![Control Center](assets/demo/gifs/02-control-center.gif)
-
-Per-community dashboard and moderation controls.
-
-### Live Enforcement
-![Live Enforcement](assets/demo/gifs/03-live-enforcement.gif)
-
-Real moderation actions and ban-management workflow.
-
-### Human Review
-![Human Review](assets/demo/gifs/04-human-review.gif)
-
-Ambiguous conflict escalates with conversation context.
-
-### Community Policy
-![Community Policy](assets/demo/gifs/05-community-policy.gif)
-
-Natural-language community rules compiled into structured enforcement.
-
-### System Diagnostics
-![System Diagnostics](assets/demo/gifs/06-system-diagnostics.gif)
-
-Telegram, database, Ollama, LLM and embedding health checks.
-
-### Safe Test Mode
-![Safe Test Mode](assets/demo/gifs/07-safe-test-mode.gif)
-
-Safe simulations for critical moderation actions.
-
+```mermaid
+flowchart TD
+    A[Telegram event] --> B{Immune account?}
+    B -- Yes --> Z[Ignore moderation]
+    B -- No --> C[Context + history + signals]
+    C --> D[Fast AI triage]
+    D --> E{Needs deeper analysis?}
+    E -- Yes --> F[Deep AI moderation]
+    E -- No --> G[Structured decision]
+    F --> G
+    G --> H[Community policy]
+    H --> I[Safety gate]
+    I --> J{Mode}
+    J -->|Shadow| K[Observe only]
+    J -->|Review| L[Moderator review]
+    J -->|Live| M[Warn / Delete / Mute / Ban]
+    K --> N[Audit + feedback]
+    L --> N
+    M --> N
+```
 
 ---
 
-## Highlights
+## Key features
 
-- **Fast → Deep AI routing** using separate local Qwen models
-- **Real moderation actions:** Warn, Delete, Mute, Ban, Unban
-- **Protected Core** for high-confidence scam, phishing, malicious links and credible threats
-- **Progressive enforcement** for spam and flood
-- **Human-review tickets** for ambiguous fights and contextual harassment
-- **Natural-language Community Policy** with per-chat rules
-- **Shadow Mode** for safe dry evaluation before live enforcement
-- **Auto-ban kill switch** with temporary-mute fallback
-- **Semantic campaign detection** using local embeddings
-- **Raid Guard** for confirmed multi-user hostile campaigns
-- **Moderator Feedback Memory** for chat-scoped gray-area decisions
-- **Known Pattern Memory** for repeated confirmed malicious payloads
-- **Multi-community isolation** with independent settings and policies
-- **Telegram group → supergroup migration recovery**
-- **Stale-chat lifecycle cleanup** when the bot leaves or is removed
-- **Per-user multi-party conflict state** for fair first-offense handling
-- **Graceful Ctrl+C shutdown** with isolated resource cleanup
-- **Ban registry** with newest-first pagination, search and unban
-- **Diagnostics** for Telegram, database, Ollama, Fast/Deep LLMs and embeddings
-- **217 automated regression tests**
+### Context-aware AI moderation
+
+- Fast → Deep LLM routing for efficient moderation.
+- Conversation context and user history are included in decisions.
+- Structured AI output is validated before enforcement.
+- Community-specific policies can strengthen the baseline moderation rules.
+
+### Real moderation actions
+
+ModGuard can perform real Telegram moderation actions:
+
+- warning;
+- message deletion;
+- temporary mute;
+- ban;
+- moderator review / ticket creation.
+
+### Shadow / Review / Live operation
+
+- **Shadow** — analyze violations without destructive actions.
+- **Review** — uncertain cases are routed to a moderator.
+- **Live** — validated decisions can be enforced automatically.
+
+This makes gradual rollout possible before trusting automation in a real community.
+
+### Raid Guard & semantic campaigns
+
+- Detects coordinated bursts of suspicious activity.
+- Tracks semantically similar messages instead of relying only on exact duplicates.
+- Helps identify repeated scam / spam campaigns with multiple text variations.
+
+### Moderator feedback memory
+
+Moderator decisions are stored as feedback so confirmed patterns can be recognized again while remaining scoped to the relevant community.
+
+### Diagnostics & audit
+
+- Operational diagnostics for core services.
+- Persistent moderation history.
+- Audit trail for enforcement actions.
+- Re-review and feedback workflows for disputed decisions.
+
+---
+
+## Safety & identity protection
+
+### Immunity List
+
+Trusted bots and service accounts can be fully excluded from moderation by Telegram username or user ID.
+
+Immune accounts bypass:
+
+- AI analysis;
+- spam / scam / flood detection;
+- semantic clustering;
+- warnings;
+- deletes;
+- mutes;
+- bans;
+- moderation tickets.
+
+This is useful for service bots, integrations and trusted automation accounts inside a community.
+
+### Fake Admin / Fake Moderator detection
+
+ModGuard distinguishes real Telegram administrators by their actual Telegram identity and role.
+
+Suspicious accounts are checked for combinations of:
+
+- similarity to a real administrator's username or display name;
+- markers such as `Admin`, `Moderator`, `Support` or `Official`;
+- suspicious links;
+- wallet / seed / verification requests;
+- financial solicitation;
+- attempts to move users into private messages.
+
+A suspicious name **alone is not enough** for enforcement. ModGuard requires impersonation signals together with dangerous behavior before escalating the case.
+
+### Automatic Safety Circuit Breaker
+
+ModGuard monitors its own moderation behavior.
+
+If destructive actions or execution failures exceed safe thresholds, the affected community is automatically forced into persistent **Shadow Mode**.
+
+Default safety conditions include:
+
+- 5 mute / ban actions within 60 seconds;
+- 20 destructive actions within 60 seconds;
+- 3 Telegram execution failures within 120 seconds;
+- 3 moderation-pipeline failures within 120 seconds.
+
+After a safety trip, destructive actions stop and **Live Mode is not restored automatically**. Human review is required.
+
+### Time-aware reputation
+
+Minor violations should not punish a user forever.
+
+LIGHT reputation for spam, flood and targeted harassment uses a configurable decay window. The default is **6 hours**.
+
+Example:
+
+```text
+warning
+→ repeated minor offense within 6h
+→ escalation
+
+warning
+→ long inactivity
+→ next minor offense starts from warning again
+```
+
+MEDIUM / HEAVY safety history is intentionally retained.
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    TG[Telegram message / edit / caption] --> CTX[Context Builder]
-    CTX --> FAST[Fast AI · qwen3:1.7b]
-    FAST -->|clearly safe| CHALLENGE[Independent Safe Challenge]
-    FAST -->|suspicious / uncertain| DEEP[Deep AI · qwen3:8b]
-    CHALLENGE -->|safe| POLICY[Deterministic PolicyGate]
-    CHALLENGE -->|needs deeper review| DEEP
-    DEEP --> POLICY
-
-    POLICY --> EXEC[Moderation Executor]
-    EXEC --> ALLOW[Allow]
-    EXEC --> WARN[Warn]
-    EXEC --> DELETE[Delete]
-    EXEC --> MUTE[Mute]
-    EXEC --> BAN[Ban]
-    EXEC --> REVIEW[Human Review Ticket]
-
-    REVIEW --> FEEDBACK[Moderator Feedback Memory]
-
-    EXEC --> AUDIT[(SQLite Audit / State)]
-    AUDIT --> DASH[Admin Control Center]
-
-    TG --> SEM[Semantic Clustering]
-    SEM --> RAID[Raid Guard]
-    RAID --> POLICY
-
-    COMMUNITY[Natural-language Community Policy] --> POLICY
+```text
+app/
+├── admin/                 # dashboard, audit, controls, diagnostics
+├── agent/                 # context, prompts, moderation reasoning
+├── bot/                   # Telegram handlers and callbacks
+├── community_policy/      # per-community policy overlay
+├── database/              # persistence and repositories
+├── feedback/              # moderator feedback memory
+├── llm/                   # local LLM providers
+├── moderation/            # policy, execution, safety, identity checks
+├── raid_guard/            # raid detection
+├── semantic_clustering/   # semantic campaign detection
+└── utils/                 # shared infrastructure
 ```
 
-A deeper architecture breakdown is available in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The public repository intentionally contains only the agent itself and its public moderation features.
 
 ---
 
-## Safety Model
+## Tech stack
 
-The LLM does **not** directly call Telegram moderation methods.
-
-Every model decision is converted into structured data and validated by deterministic code before anything destructive can happen.
-
-### Protected Core
-
-High-confidence security violations can be handled autonomously:
-
-- phishing / credential theft
-- confirmed scam or fraud
-- malicious links
-- credible direct threats
-- obvious coordinated spam campaigns
-
-### Contextual behavior
-
-Human conflict is intentionally more conservative:
-
-- first clear targeted aggression → warning
-- repeated or ambiguous conflict → moderator review
-- unclear multi-party fights → moderator review
-- moderator sees conversation context before deciding
-
-### Additional safety controls
-
-- **Shadow Mode:** observe decisions without destructive actions
-- **Auto-ban OFF:** a BAN verdict falls back to temporary mute + delete
-- **Current-message evidence:** history cannot make a harmless current message guilty
-- **Semantic clustering is observational:** similarity alone cannot punish a message
-- **Per-chat memory:** one community's behavioral history does not become another community's reputation
-
----
-
-## Admin Control Center
-
-ModGuard exposes an inline Telegram admin interface for each managed community:
-
-- Dashboard and 24h activity
-- Open review tickets
-- Shadow / Live mode
-- Auto-ban switch
-- Mute duration
-- Safety Policy
-- Community Policy
-- Raid Guard
-- Ban search / pagination / unban
-- Test Mode
-- Diagnostics
-- Multi-chat switching
-
-Settings are isolated per Telegram community.
-
----
-
-## Local AI Stack
-
-| Role | Default model |
+| Layer | Technology |
 |---|---|
-| Fast semantic triage | `qwen3:1.7b` |
-| Deep moderation reasoning | `qwen3:8b` |
-| Semantic embeddings | `qwen3-embedding:0.6b` |
-
-All inference is performed through a local Ollama instance.
-
----
-
-## Quick Start
-
-### 1. Install and prepare Ollama
-
-```bash
-ollama pull qwen3:1.7b
-ollama pull qwen3:8b
-ollama pull qwen3-embedding:0.6b
-```
-
-### 2. Create a virtual environment
-
-Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-```
-
-Linux / macOS:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-### 3. Configure ModGuard
-
-Copy the example configuration:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Set at minimum:
-
-```env
-TELEGRAM_BOT_TOKEN=your_bot_token
-ADMIN_IDS=your_telegram_user_id
-```
-
-Safe defaults ship with:
-
-```env
-DRY_RUN=true
-LIVE_DELETE_ENABLED=false
-```
-
-Start in Shadow / dry-run mode before enabling live moderation.
-
-### 4. Give the bot Telegram permissions
-
-For full functionality the bot should be a group administrator with permission to:
-
-- delete messages
-- restrict members
-- ban users
-
-### 5. Run
-
-```powershell
-python run.py
-```
-
-`run.py` is the recommended launcher and exits cleanly on `Ctrl+C`.
+| Language | Python |
+| Telegram | aiogram 3 |
+| Local AI | Ollama |
+| Validation | Pydantic |
+| Database | SQLite + SQLAlchemy / aiosqlite |
+| Async networking | aiohttp |
+| Testing | pytest + pytest-asyncio |
+| Semantic analysis | local embeddings |
 
 ---
 
 ## Testing
 
-Install development dependencies:
-
-```powershell
-python -m pip install -r requirements-dev.txt
-```
-
-Run the regression suite:
-
-```powershell
-python -m pytest -v
-```
-
-The suite covers policy boundaries, false-positive guards, report re-review, community policies, moderation actions, semantic clustering, Raid Guard, feedback memory, chat migration, Test Mode and admin controls.
-
-See [`docs/TESTING.md`](docs/TESTING.md) for the testing philosophy.
-
----
-
-## Project Structure
+The public `v1.2.0` build was validated with the private commercial control plane physically absent.
 
 ```text
-modguard/
-├── app/
-│   ├── admin/                  # Dashboard, settings, tickets, Test Mode
-│   ├── agent/                  # Fast/Deep prompts, routing, structured decisions
-│   ├── bot/                    # Telegram handlers
-│   ├── community_policy/       # Natural-language per-chat policy overlay
-│   ├── database/               # Async SQLite persistence
-│   ├── feedback/               # Moderator feedback memory
-│   ├── llm/                    # Ollama structured-output client
-│   ├── moderation/             # PolicyGate and deterministic executor
-│   ├── raid_guard/             # Multi-user campaign protection
-│   ├── semantic_clustering/    # Embeddings and campaign observations
-│   └── utils/                  # Caches, normalization, locks, throttling
-├── docs/
-│   ├── ARCHITECTURE.md
-│   └── TESTING.md
-├── tests/
-├── .env.example
-├── requirements.txt
-├── requirements-dev.txt
-└── run.py
+255 tests passed
+3 full public regression runs passed
+```
+
+Run the test suite:
+
+```powershell
+python -m pytest -q
+```
+
+Compile check:
+
+```powershell
+python -m compileall -q app tests
 ```
 
 ---
 
-## Engineering Focus
+## Getting started
 
-This project was built as a portfolio case study in practical AI automation. The interesting part is not just classification accuracy; it is designing a system where probabilistic model output can safely drive real-world actions.
+### 1. Clone the repository
 
-Key engineering problems addressed:
+```bash
+git clone <YOUR_REPOSITORY_URL>
+cd modguard
+```
 
-- structured LLM output and repair
-- fast/slow model routing
-- false-positive containment
-- current-message vs historical-context separation
-- deterministic enforcement policy
-- human-in-the-loop escalation
-- async Telegram actions
-- per-community state isolation
-- semantic campaign detection without semantic overreach
-- rollback-friendly ban management
-- regression testing for previously observed failures
+### 2. Create a virtual environment
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+### 3. Install dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+### 4. Configure environment
+
+Copy `.env.example` to `.env` and provide your Telegram bot token, administrator IDs and Ollama configuration.
+
+### 5. Start Ollama models
+
+Make sure the configured local models are available before starting ModGuard.
+
+### 6. Run
+
+```powershell
+python run.py
+```
+
+or:
+
+```powershell
+python -m app.main
+```
 
 ---
 
-## Version
+## Releases
 
-**ModGuard v1.0.1 — Portfolio Release**
+### `v1.2.0 — Safety & Identity Protection` — current
 
-The moderation core is treated as a frozen baseline for the portfolio version. Future work will focus primarily on deployment, operational tooling and commercial pilot infrastructure rather than changing the tested moderation behavior.
+Focus: hardening ModGuard for real-world community pilots.
 
-See [`CHANGELOG.md`](CHANGELOG.md).
+**Added:**
+
+- Immunity List for trusted bots and service accounts;
+- Fake Admin / Fake Moderator protection;
+- automatic per-community Safety Circuit Breaker;
+- configurable LIGHT reputation decay;
+- compact Settings / Safety & Tools separation;
+- additional regression coverage for safety and identity flows.
+
+**Validation:** `255 tests passed` in the public build.
+
+### `v1.0.0 — Portfolio Release`
+
+Initial frozen portfolio release demonstrating the core ModGuard architecture:
+
+- local Fast → Deep LLM moderation;
+- deterministic policy gate;
+- community-specific policies;
+- real Telegram enforcement actions;
+- Shadow / Review / Live workflows;
+- Raid Guard;
+- semantic campaign detection;
+- moderator feedback memory;
+- audit and diagnostics.
+
+> Full release notes are available in the repository's **Releases** section.
 
 ---
 
-## Security
+## Roadmap
 
-Never commit a real `.env`, Telegram token, database, moderation logs or customer chat data.
-
-See [`SECURITY.md`](SECURITY.md).
+- Real-world community pilot.
+- Production deployment and monitoring tooling.
+- Extended moderation analytics.
+- Multi-community operational tooling.
+- Additional platform integrations.
 
 ---
 
-## Author
+## Design principle
 
-Built by **0xkentoshi** as part of an AI automation portfolio.
+ModGuard is built around one rule:
 
-Open to opportunities in **AI automation, AI agents, Python automation and workflow automation**.
+> **AI interprets. Policy decides. Safety limits. Software executes. Humans remain in control.**
+
+The goal is not maximum autonomy. The goal is reliable automation with explicit boundaries, observability and recovery paths.
+
+---
+
+## License
+
+See the repository license for usage terms.
