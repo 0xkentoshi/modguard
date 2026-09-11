@@ -9,6 +9,7 @@
 ![Telegram](https://img.shields.io/badge/Telegram-aiogram-26A5E4?logo=telegram&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-Ollama-black)
 ![Tests](https://img.shields.io/badge/regression_tests-253-success)
+[![CI](https://github.com/0xkentoshi/modguard/actions/workflows/ci.yml/badge.svg)](https://github.com/0xkentoshi/modguard/actions/workflows/ci.yml)
 
 **Real moderation actions · Local LLMs · Deterministic safety · Human review**
 
