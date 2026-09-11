@@ -11,8 +11,8 @@ async def test_basic_group_migration_collapses_duplicate_chat_and_preserves_sett
     await db.init()
     repo = ControlRepository(db.session_factory)
 
-    old_id = -123456789
-    new_id = -1001234567890
+    old_id = -5465551972
+    new_id = -1004432432239
 
     await repo.ensure_chat_settings(chat_id=old_id, chat_title="Sandbox 4")
     await repo.toggle_shadow(old_id)

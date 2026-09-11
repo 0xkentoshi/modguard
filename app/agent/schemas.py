@@ -106,6 +106,10 @@ class MessageContext(BaseModel):
         default_factory=list
     )
 
+    # LIGHT offense reputation window for this community. 0 means no decay.
+    # Spam/flood/harassment ladders use this; MEDIUM/HEAVY safety history does not.
+    light_offense_decay_hours: int = Field(default=6, ge=0, le=8760)
+
     # The actual Telegram message being replied to, when available.
     reply_target_message: MessageSnapshot | None = None
 

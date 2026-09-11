@@ -50,6 +50,20 @@ def format_duration(minutes: int) -> str:
     return f"{minutes} min"
 
 
+def format_hours_window(hours: int) -> str:
+    hours = int(hours)
+    if hours <= 0:
+        return "never"
+    if hours == 1:
+        return "1 hour"
+    if hours < 24:
+        return f"{hours} hours"
+    if hours % 24 == 0:
+        days = hours // 24
+        return f"{days} day" if days == 1 else f"{days} days"
+    return f"{hours} hours"
+
+
 def is_not_modified_error(exc: Exception) -> bool:
     return "message is not modified" in str(exc).lower()
 
@@ -92,6 +106,7 @@ class DashboardService:
         global_dry_run: bool,
         live_delete_enabled: bool,
         raid_guard_available: bool = True,
+        access_service=None,
     ):
         self.bot = bot
         self.repository = repository
@@ -99,6 +114,7 @@ class DashboardService:
         self.global_dry_run = global_dry_run
         self.live_delete_enabled = live_delete_enabled
         self.raid_guard_available = raid_guard_available
+        self.access_service = access_service
         self._refresh_tasks: dict[int, asyncio.Task] = {}
         self._registry_reconciled = False
         self._registry_reconcile_lock = asyncio.Lock()
@@ -225,10 +241,36 @@ class DashboardService:
             self._registry_reconciled = True
             return repaired
 
+    async def _visible_chats(self, admin_id: int):
+        chats = await self.repository.list_managed_chats()
+        if self.access_service is None:
+            return chats
+        try:
+            if await self.access_service.is_superadmin(admin_id):
+                return chats
+            allowed_ids = set(await self.access_service.list_allowed_chat_ids(admin_id))
+            return [chat for chat in chats if chat.chat_id in allowed_ids]
+        except Exception:
+            logger.exception("Pilot chat visibility failed | admin=%s", admin_id)
+            return []
+
+    async def admin_can_access_chat(self, admin_id: int, chat_id: int) -> bool:
+        if self.access_service is None:
+            return True
+        try:
+            return bool(await self.access_service.can_access_chat(admin_id, chat_id))
+        except Exception:
+            logger.exception(
+                "Pilot dashboard access failed | admin=%s | chat=%s",
+                admin_id,
+                chat_id,
+            )
+            return False
+
     async def _choose_chat(self, admin_id: int) -> int | None:
         await self.reconcile_managed_chats()
         state = await self.repository.get_dashboard_state(admin_id)
-        chats = await self.repository.list_managed_chats()
+        chats = await self._visible_chats(admin_id)
         if not chats:
             return None
         chat_ids = {chat.chat_id for chat in chats}
@@ -286,12 +328,15 @@ class DashboardService:
         settings = await self.repository.get_chat_settings(chat_id)
         live_ban_enabled = await self.repository.get_live_ban_enabled(chat_id)
         mute_duration_minutes = await self.repository.get_mute_duration_minutes(chat_id)
+        light_decay_hours = await self.repository.get_light_offense_decay_hours(chat_id)
         raid_guard_enabled = await self.repository.get_raid_guard_enabled(chat_id)
         title = await self._chat_title(chat_id)
+
         shadow = "ON" if settings.shadow_mode else "OFF"
         cleanup = "ON" if (not self.global_dry_run and self.live_delete_enabled) else "OFF"
         autoban = "ON" if live_ban_enabled else "OFF"
         mute_duration = format_duration(mute_duration_minutes)
+        light_memory = format_hours_window(light_decay_hours)
         raid = (
             "UNAVAILABLE"
             if not self.raid_guard_available
@@ -301,61 +346,191 @@ class DashboardService:
         text = (
             "<b>⚙️ SETTINGS</b>\n"
             f"{esc(title)}\n"
-            "<i>Settings apply only to the selected chat.</i>\n\n"
-            f"Shadow        <b>{shadow}</b>\n"
-            f"Live cleanup  <b>{cleanup}</b>\n"
-            f"Auto-ban      <b>{autoban}</b>\n"
-            f"Mute duration <b>{esc(mute_duration)}</b>\n"
-            f"Raid Guard    <b>{raid}</b>\n\n"
-            "Shadow blocks delete/ban actions while showing moderators "
-            "what ModGuard would do in LIVE mode.\n"
-            "Auto-ban is OFF by default. When OFF, a confident BAN verdict "
-            "falls back to temporary mute + message deletion instead of a permanent ban.\n"
-            "Default spam/flood ladder: first clear offense → warn; repeat → "
-            "mute + delete; repeat after mute → ban + delete.\n"
-            "Human conflict: first clear targeted harassment → warn; repeat or ambiguity → "
-            "moderator Ticket (no default autonomous mute/ban).\n"
-            "MEDIUM offenses start at mute + delete. HEAVY protected threats "
-            "start at ban + delete when confidence is high.\n"
-            "Mute duration is one value for this chat and is used by all "
-            "automatic/manual mutes.\n"
-            "Change chat switches to an independent settings profile "
-            "for another community.\n"
-            "Raid Guard is OFF by default and only reacts to high-confidence "
-            "multi-user hard-risk campaigns."
-        )
-
-        rows = [
-            [InlineKeyboardButton(text=f"🛡 Shadow: {shadow}", callback_data=f"mg:shadow:{chat_id}")],
-            [InlineKeyboardButton(text=f"🚫 Auto-ban: {autoban}", callback_data=f"mg:ban_toggle:{chat_id}")],
-            [InlineKeyboardButton(text=f"🔇 Mute duration: {mute_duration}", callback_data=f"mg:mute_duration:{chat_id}")],
-            [InlineKeyboardButton(text=f"🚨 Raid Guard: {raid}", callback_data=f"mg:raid_toggle:{chat_id}")],
-            [InlineKeyboardButton(text="⚖️ Safety policy", callback_data=f"mg:safety:{chat_id}")],
-            [InlineKeyboardButton(text="📜 Community policy", callback_data=f"mg:policy:{chat_id}")],
-            [InlineKeyboardButton(text="🩺 Diagnostics", callback_data=f"mg:diag:{chat_id}")],
-            [InlineKeyboardButton(text="🚫 Banned users", callback_data=f"mg:bans:{chat_id}")],
-            [InlineKeyboardButton(text="🧹 Clear shadow alerts", callback_data=f"mg:shadow_clear:{chat_id}")],
-        ]
-
-        latest_raid = await self.repository.latest_raid_incident(
-            chat_id=chat_id
-        )
-        if latest_raid is not None:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"🚨 Last raid · {latest_raid.incident_key}",
-                        callback_data=f"mg:raid_incident:{latest_raid.id}",
-                    )
-                ]
-            )
-
-        rows.append(
-            [InlineKeyboardButton(text="◀ Dashboard", callback_data=f"mg:dash:{chat_id}")]
+            "<i>Only everyday controls live here. Safety/diagnostics/history moved to Tools.</i>\n\n"
+            f"Shadow         <b>{shadow}</b>\n"
+            f"Live cleanup   <b>{cleanup}</b>\n"
+            f"Auto-ban       <b>{autoban}</b>\n"
+            f"Mute duration  <b>{esc(mute_duration)}</b>\n"
+            f"Light memory   <b>{esc(light_memory)}</b>\n"
+            f"Raid Guard     <b>{raid}</b>\n\n"
+            "Light memory affects only minor spam/flood/harassment escalation. "
+            "After the window expires, a new LIGHT offense starts from warning again. "
+            "MEDIUM/HEAVY safety history does not decay."
         )
 
         keyboard = InlineKeyboardMarkup(
-            inline_keyboard=rows
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"🛡 Shadow: {shadow}",
+                        callback_data=f"mg:shadow:{chat_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text=f"🚫 Auto-ban: {autoban}",
+                        callback_data=f"mg:ban_toggle:{chat_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=f"🔇 Mute: {mute_duration}",
+                        callback_data=f"mg:mute_duration:{chat_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text=f"🕒 Memory: {light_memory}",
+                        callback_data=f"mg:light_memory:{chat_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=f"🚨 Raid: {raid}",
+                        callback_data=f"mg:raid_toggle:{chat_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="📜 Policy",
+                        callback_data=f"mg:policy:{chat_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🧰 Safety & tools",
+                        callback_data=f"mg:tools:{chat_id}",
+                    )
+                ],
+                [InlineKeyboardButton(text="◀ Dashboard", callback_data=f"mg:dash:{chat_id}")],
+            ]
+        )
+        return text, keyboard
+
+    async def light_memory_payload(self, *, chat_id: int):
+        title = await self._chat_title(chat_id)
+        current = await self.repository.get_light_offense_decay_hours(chat_id)
+        text = (
+            "<b>🕒 LIGHT OFFENSE MEMORY</b>\n"
+            f"{esc(title)}\n\n"
+            f"Current window: <b>{esc(format_hours_window(current))}</b>\n\n"
+            "Applies only to LIGHT reputation: spam, flood and targeted-harassment "
+            "warning ladders. When this time passes, old minor offenses stop escalating "
+            "a new incident. MEDIUM/HEAVY safety history stays intact.\n\n"
+            "Recommended default: <b>6 hours</b>."
+        )
+        options = [1, 3, 6, 12, 24, 72, 168, 0]
+        labels = {0: "Never expire"}
+        rows = []
+        for index in range(0, len(options), 2):
+            row = []
+            for hours in options[index:index + 2]:
+                label = labels.get(hours, format_hours_window(hours))
+                selected = " ✓" if hours == current else ""
+                row.append(InlineKeyboardButton(
+                    text=label + selected,
+                    callback_data=f"mg:light_memory_set:{chat_id}:{hours}",
+                ))
+            rows.append(row)
+        rows.append([InlineKeyboardButton(
+            text="◀ Settings", callback_data=f"mg:settings:{chat_id}"
+        )])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def tools_payload(self, *, chat_id: int):
+        title = await self._chat_title(chat_id)
+        immunity_count = len(await self.repository.list_moderation_immunity(chat_id=chat_id))
+        latest_raid = await self.repository.latest_raid_incident(chat_id=chat_id)
+
+        text = (
+            "<b>🧰 SAFETY & TOOLS</b>\n"
+            f"{esc(title)}\n\n"
+            "Operational tools, safety controls and investigation views are kept "
+            "separate from everyday settings.\n\n"
+            f"Immunity entries: <b>{immunity_count}</b>\n"
+            "Auto-stop: <b>ARMED</b> · abnormal action bursts or repeated failures force SHADOW."
+        )
+
+        rows = [
+            [
+                InlineKeyboardButton(text="⚖️ Safety policy", callback_data=f"mg:safety:{chat_id}"),
+                InlineKeyboardButton(text="🩺 Diagnostics", callback_data=f"mg:diag:{chat_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🚫 Banned users", callback_data=f"mg:bans:{chat_id}"),
+                InlineKeyboardButton(text="🧿 Immunity", callback_data=f"mg:immune:{chat_id}"),
+            ],
+            [InlineKeyboardButton(text="🧹 Clear shadow alerts", callback_data=f"mg:shadow_clear:{chat_id}")],
+        ]
+        if latest_raid is not None:
+            rows.append([InlineKeyboardButton(
+                text=f"🚨 Last raid · {latest_raid.incident_key}",
+                callback_data=f"mg:raid_incident:{latest_raid.id}",
+            )])
+        rows.append([InlineKeyboardButton(text="◀ Settings", callback_data=f"mg:settings:{chat_id}")])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def immunity_payload(self, *, chat_id: int, status: str | None = None):
+        chat_id = await self.repository.resolve_chat_id(chat_id)
+        title = await self._chat_title(chat_id)
+        records = await self.repository.list_moderation_immunity(chat_id=chat_id)
+
+        text = (
+            "<b>🧿 IMMUNITY LIST</b>\n"
+            f"{esc(title)}\n\n"
+            "Users/bots in this list bypass ModGuard completely: no AI analysis, "
+            "spam/flood checks, tickets, delete, mute or ban.\n"
+            "Use this mainly for trusted service bots and integrations."
+        )
+        if status:
+            text += f"\n\n<b>{esc(status)}</b>"
+
+        rows = []
+        if records:
+            text += "\n\n<b>Protected accounts</b>"
+            for record in records[:30]:
+                if record.user_id is not None:
+                    label = f"ID {record.user_id}"
+                    if record.username:
+                        label += f" · @{record.username}"
+                else:
+                    label = f"@{record.username}"
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"❌ {label[:48]}",
+                        callback_data=f"mg:immune_del:{chat_id}:{record.id}",
+                    )
+                ])
+        else:
+            text += "\n\n<i>No immunity entries.</i>"
+
+        rows.append([
+            InlineKeyboardButton(
+                text="➕ Add by @username / ID",
+                callback_data=f"mg:immune_add:{chat_id}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="◀ Tools",
+                callback_data=f"mg:tools:{chat_id}",
+            )
+        ])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def immunity_input_payload(self, *, chat_id: int, error: str | None = None):
+        title = await self._chat_title(chat_id)
+        text = (
+            "<b>➕ ADD IMMUNITY</b>\n"
+            f"{esc(title)}\n\n"
+            "Send one Telegram user/bot as either:\n"
+            "• numeric user ID, for example <code>123456789</code>\n"
+            "• @username, for example <code>@service_bot</code>\n\n"
+            "The account will become fully immune from ModGuard in this chat."
+        )
+        if error:
+            text += f"\n\n<b>Error</b>\n{esc(compact(error, 300))}"
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="❌ Cancel",
+                    callback_data=f"mg:immune:{chat_id}",
+                )
+            ]]
         )
         return text, keyboard
 
@@ -495,7 +670,7 @@ class DashboardService:
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Run again", callback_data=f"mg:diag:{chat_id}")],
-            [InlineKeyboardButton(text="◀ Settings", callback_data=f"mg:settings:{chat_id}")],
+            [InlineKeyboardButton(text="◀ Tools", callback_data=f"mg:tools:{chat_id}")],
         ])
         return text, keyboard, chat_id
 
@@ -856,8 +1031,9 @@ class DashboardService:
             "<b>LIGHT · configurable</b>\n"
             "Ordinary spam/flood.\n"
             "→ WARN (message stays)\n"
-            "→ repeat: MUTE + DELETE\n"
-            "→ repeat after mute: BAN + DELETE\n\n"
+            "→ repeat inside Light-memory window: MUTE + DELETE\n"
+            "→ repeat after mute inside the window: BAN + DELETE\n"
+            "→ after Light memory expires: ladder starts from WARN again\n\n"
             "<b>HUMAN CONFLICT · conservative Core</b>\n"
             "Clear first targeted harassment → WARN (message stays).\n"
             "Repeat, mutual fight, unclear instigator, or uncertainty → moderator Ticket.\n"
@@ -877,13 +1053,16 @@ class DashboardService:
             "<b>Community Policy</b> may relax or strengthen LIGHT/MEDIUM community "
             "behavior (for example, allow ordinary spam in a crypto chat), but it "
             "cannot weaken Protected Core threats.\n\n"
+            "<b>Automatic safety circuit</b>\n"
+            "Abnormal destructive-action bursts or repeated execution/pipeline failures "
+            "automatically force this chat into SHADOW until a human reviews it.\n\n"
             "<i>Auto-ban remains the per-chat kill switch for real autonomous bans. "
             "Raid Guard separately handles confirmed multi-user hostile campaigns.</i>"
         )
 
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(
-                text="◀ Settings", callback_data=f"mg:settings:{chat_id}"
+                text="◀ Tools", callback_data=f"mg:tools:{chat_id}"
             )]]
         )
         return text, keyboard
@@ -940,8 +1119,8 @@ class DashboardService:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="◀ Settings",
-                    callback_data=f"mg:settings:{incident.chat_id}",
+                    text="◀ Tools",
+                    callback_data=f"mg:tools:{incident.chat_id}",
                 )
             ]
         )
@@ -1016,8 +1195,8 @@ class DashboardService:
         ])
         rows.append([
             InlineKeyboardButton(
-                text="◀ Settings",
-                callback_data=f"mg:settings:{chat_id}",
+                text="◀ Tools",
+                callback_data=f"mg:tools:{chat_id}",
             )
         ])
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1181,9 +1360,9 @@ class DashboardService:
         )
         return text, keyboard, ticket.chat_id
 
-    async def chats_payload(self):
+    async def chats_payload(self, *, admin_id: int):
         await self.reconcile_managed_chats(force=True)
-        chats = await self.repository.list_managed_chats()
+        chats = await self._visible_chats(admin_id)
         rows = [
             [InlineKeyboardButton(text=chat.title[:60], callback_data=f"mg:dash:{chat.chat_id}")]
             for chat in chats
@@ -1273,6 +1452,8 @@ class DashboardService:
     async def open_dashboard(self, *, admin_id: int, chat_id: int | None = None) -> None:
         if chat_id is None:
             chat_id = await self._choose_chat(admin_id)
+        elif not await self.admin_can_access_chat(admin_id, chat_id):
+            chat_id = await self._choose_chat(admin_id)
 
         if chat_id is None:
             await self.render(
@@ -1313,6 +1494,8 @@ class DashboardService:
 
         for state in states:
             if state.dashboard_message_id is None:
+                continue
+            if not await self.admin_can_access_chat(state.admin_id, chat_id):
                 continue
             try:
                 await self.bot.edit_message_text(

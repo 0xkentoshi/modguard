@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from app.agent.schemas import (
     MessageContext,
     ModerationDecision,
@@ -81,17 +83,43 @@ class PolicyGate:
         context: MessageContext | None,
         *,
         categories: set[str],
+        max_age_hours: int | None = None,
     ) -> list[str]:
         if context is None:
             return []
+
+        cutoff = None
+        if max_age_hours is not None and int(max_age_hours) > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=int(max_age_hours))
+
         actions: list[str] = []
         for event in (context.user_moderation_history or []):
             if getattr(event, "category", None) not in categories:
                 continue
+
+            if cutoff is not None:
+                created_at = getattr(event, "created_at", None)
+                if created_at is None:
+                    # Missing timestamps must never silently escalate a LIGHT offense.
+                    continue
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                else:
+                    created_at = created_at.astimezone(timezone.utc)
+                if created_at < cutoff:
+                    continue
+
             action = getattr(event, "action", None)
             if action:
                 actions.append(str(action))
         return actions
+
+    @staticmethod
+    def _light_decay_hours(context: MessageContext | None) -> int | None:
+        if context is None:
+            return 6
+        hours = int(getattr(context, "light_offense_decay_hours", 6))
+        return None if hours <= 0 else hours
 
     def _protected_heavy(
         self,
@@ -164,6 +192,7 @@ class PolicyGate:
         history = self._history_actions(
             context,
             categories=history_categories,
+            max_age_hours=self._light_decay_hours(context),
         )
 
         if "mute" in history:
@@ -225,6 +254,7 @@ class PolicyGate:
         history = self._history_actions(
             context,
             categories={"harassment"},
+            max_age_hours=self._light_decay_hours(context),
         )
         if any(action in {"warn", "delete", "mute", "ban"} for action in history):
             return self._escalate(
@@ -333,6 +363,7 @@ class PolicyGate:
             history = self._history_actions(
                 context,
                 categories={"harassment"},
+                max_age_hours=self._light_decay_hours(context),
             )
             if any(
                 action_name in {"warn", "delete", "mute", "ban"}

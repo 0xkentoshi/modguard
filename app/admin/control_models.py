@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.models import Base
@@ -86,6 +86,28 @@ class ChatMuteSettingsRecord(Base):
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     mute_duration_minutes: Mapped[int] = mapped_column(
         Integer, default=60, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class ChatReputationSettingsRecord(Base):
+    """Per-chat decay window for LIGHT offense escalation.
+
+    Only LIGHT reputation (spam/flood/harassment warning ladders) expires.
+    MEDIUM/HEAVY safety history remains intact. A value of 0 means the
+    LIGHT history never expires.
+    """
+
+    __tablename__ = "chat_reputation_settings"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    light_offense_decay_hours: Mapped[int] = mapped_column(
+        Integer, default=6, nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, nullable=False
@@ -568,3 +590,24 @@ class ModerationBanRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     unbanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+
+
+class ModerationImmunityRecord(Base):
+    """Per-chat full moderation immunity for trusted bots/service accounts."""
+
+    __tablename__ = "moderation_immunity"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id",
+            "subject_key",
+            name="uq_moderation_immunity_chat_subject",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    username: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    created_by_admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)

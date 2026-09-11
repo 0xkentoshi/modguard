@@ -73,6 +73,15 @@ reporter_has_independent_violation=true
 
 "ахах норм" -> report_target=false
 
+"ты тупой идиот, заткнись" -> report_target=false,
+reporter_has_independent_violation=true
+
+"сам заткнись, ты тупой идиот" -> report_target=false,
+reporter_has_independent_violation=true
+
+A direct insult aimed at the replied-to participant is an ordinary hostile reply,
+NOT a report merely because it refers to that participant.
+
 "Mods, please check this. This user keeps starting fights." -> report_target=true,
 reporter_has_independent_violation=false
 

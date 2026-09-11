@@ -31,7 +31,9 @@ from app.database.repository import (
 )
 from app.llm.ollama import OllamaProvider
 from app.moderation.executor import ModerationExecutor
+from app.moderation.fake_admin import FakeAdminDetector
 from app.moderation.policy import PolicyGate
+from app.moderation.safety_circuit import SafetyCircuitBreaker
 from app.raid_guard.service import RaidGuardService
 from app.semantic_clustering.ollama_embeddings import OllamaEmbeddingProvider
 from app.semantic_clustering.service import SemanticClusterService
@@ -353,6 +355,38 @@ async def main() -> None:
         )
     )
 
+    # Pilot Edition owner-only control plane is optional and intentionally
+    # lives in the git-ignored private_ops package. Public GitHub builds keep
+    # full core moderation functionality when this package is absent.
+    pilot_access_service = None
+    private_ops_router = None
+    try:
+        from private_ops import PrivateOpsService, router as private_ops_router
+
+        pilot_access_service = PrivateOpsService(
+            bot=bot,
+            control_repository=control_repository,
+            session_factory=database.session_factory,
+            fallback_superadmin_ids=settings.admin_id_list,
+        )
+        logging.info(
+            "Private Pilot Ops ready | superadmins=%s",
+            sorted(pilot_access_service.superadmin_ids),
+        )
+    except ImportError:
+        logging.info("Private Pilot Ops not installed; public admin mode active")
+    except Exception:
+        logging.exception(
+            "Private Pilot Ops failed to initialize; fail-safe public mode active"
+        )
+        pilot_access_service = None
+        private_ops_router = None
+
+    fake_admin_detector = FakeAdminDetector(
+        bot=bot,
+        cache_ttl_seconds=300,
+    )
+
     raid_guard_service = RaidGuardService(
         repository=control_repository,
         semantic_service=semantic_cluster_service,
@@ -370,6 +404,7 @@ async def main() -> None:
         admin_ids=(
             settings.admin_id_list
         ),
+        recipient_provider=pilot_access_service,
     )
 
     dashboard_service = DashboardService(
@@ -389,6 +424,7 @@ async def main() -> None:
         raid_guard_available=(
             semantic_cluster_service.enabled
         ),
+        access_service=pilot_access_service,
     )
 
     alert_throttle = (
@@ -398,6 +434,19 @@ async def main() -> None:
                 .admin_alert_cooldown_seconds
             )
         )
+    )
+
+    safety_circuit = SafetyCircuitBreaker(
+        repository=control_repository,
+        notifier=notifier,
+        dashboard_service=dashboard_service,
+        enabled=settings.safety_circuit_enabled,
+        action_window_seconds=settings.safety_action_window_seconds,
+        max_destructive_actions=settings.safety_max_destructive_actions,
+        max_punitive_actions=settings.safety_max_punitive_actions,
+        failure_window_seconds=settings.safety_failure_window_seconds,
+        max_execution_failures=settings.safety_max_execution_failures,
+        max_pipeline_failures=settings.safety_max_pipeline_failures,
     )
 
     moderation_executor = (
@@ -442,12 +491,18 @@ async def main() -> None:
             notify_new_tickets=(
                 settings.notify_new_tickets
             ),
+            safety_circuit=safety_circuit,
         )
     )
 
     chat_locks = ChatLockManager()
 
     dispatcher = Dispatcher()
+
+    if private_ops_router is not None:
+        dispatcher.include_router(
+            private_ops_router
+        )
 
     dispatcher.include_router(
         admin_router
@@ -515,6 +570,17 @@ async def main() -> None:
             "threshold=0.92 | min_messages=4 | min_users=3"
         )
 
+        logging.info(
+            "Safety circuit ready | enabled=%s | destructive=%s/%ss | punitive=%s/%ss | failures=%s/%ss",
+            settings.safety_circuit_enabled,
+            settings.safety_max_destructive_actions,
+            settings.safety_action_window_seconds,
+            settings.safety_max_punitive_actions,
+            settings.safety_action_window_seconds,
+            settings.safety_max_execution_failures,
+            settings.safety_failure_window_seconds,
+        )
+
         await dispatcher.start_polling(
             bot,
             allowed_updates=(
@@ -553,6 +619,15 @@ async def main() -> None:
             ),
             semantic_cluster_service=(
                 semantic_cluster_service
+            ),
+            fake_admin_detector=(
+                fake_admin_detector
+            ),
+            safety_circuit=(
+                safety_circuit
+            ),
+            pilot_access_service=(
+                pilot_access_service
             ),
             app_settings=settings,
         )

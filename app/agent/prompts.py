@@ -381,6 +381,17 @@ participant for ordinary harassment/fighting under the default Core policy.
 - each participant in a mutual fight is evaluated independently under that
   participant's own chat-scoped moderation history. One participant's warning
   must never count as another participant's prior warning.
+- retaliation does NOT erase the CURRENT AUTHOR'S own targeted abuse. If A
+  insults B and then B directly insults A back, evaluate both messages at the
+  moment they arrive. On each participant's first clear offense, each can
+  independently receive WARN.
+- a direct reply semantically equivalent to "ты тупой идиот, заткнись" is clear
+  targeted harassment when addressed to the replied-to participant; it is not
+  generic profanity and should not be silently allowed.
+- a retaliatory reply semantically equivalent to "сам заткнись, ты тупой идиот"
+  is also the CURRENT AUTHOR'S clear targeted harassment. If that author has no
+  prior confirmed harassment action in this chat, use WARN rather than treating
+  the other participant's warning/history as theirs.
 - only a genuinely credible direct physical threat belongs to category=threat
   and may use the protected HEAVY path
 

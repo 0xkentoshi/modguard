@@ -387,8 +387,9 @@ class ModeratorAgent:
         text = context.text_signals
         behavior = context.behavior_signals
 
-        # Replies go through Fast Triage first because it understands whether
-        # the reply is a semantic complaint/report.
+        # Replies are handled earlier in _analyze_uncached after the dedicated
+        # report-intent preflight. This helper only covers non-reply objective
+        # routing signals.
         if context.current_message.reply_to_message_id is not None:
             return False
 
@@ -745,7 +746,7 @@ class ModeratorAgent:
         ):
             logger.info(
                 "ROUTE | deep | reason=%s",
-                ("semantic_campaign_hint" if force_deep else "objective_signals"),
+                ("forced_deep" if force_deep else "objective_signals"),
             )
 
             return await self._run_deep(

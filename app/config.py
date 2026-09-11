@@ -67,6 +67,17 @@ class Settings(BaseSettings):
     autonomous_delete_threshold: float = 0.78
     autonomous_warn_threshold: float = 0.70
 
+    # Pilot safety circuit: fail closed to per-chat SHADOW on abnormal bursts
+    # or repeated pipeline/action failures. Tunable through .env, intentionally
+    # not exposed as everyday renter UI controls.
+    safety_circuit_enabled: bool = True
+    safety_action_window_seconds: int = 60
+    safety_max_destructive_actions: int = 20
+    safety_max_punitive_actions: int = 5
+    safety_failure_window_seconds: int = 120
+    safety_max_execution_failures: int = 3
+    safety_max_pipeline_failures: int = 3
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

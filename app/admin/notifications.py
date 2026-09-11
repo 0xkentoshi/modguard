@@ -39,9 +39,57 @@ class AdminNotifier:
         *,
         bot: Bot,
         admin_ids: list[int],
+        recipient_provider=None,
     ):
         self.bot = bot
         self.admin_ids = admin_ids
+        self.recipient_provider = recipient_provider
+
+    async def _recipients_for_chat(self, chat_id: int) -> set[int]:
+        recipients = set(self.admin_ids)
+        if self.recipient_provider is not None:
+            try:
+                dynamic = await self.recipient_provider.notification_recipients(chat_id)
+                recipients.update(int(item) for item in dynamic)
+            except Exception:
+                logger.exception(
+                    "Could not resolve dynamic admin recipients | chat=%s",
+                    chat_id,
+                )
+        return recipients
+
+    async def notify_system_alert(
+        self,
+        *,
+        chat_id: int,
+        title: str,
+        body: str,
+    ) -> bool:
+        """Compact operational/safety alert for owners and platform superadmins."""
+        recipients = await self._recipients_for_chat(chat_id)
+        if not recipients:
+            return False
+
+        text = (
+            f"<b>{escape(title)}</b>\n\n"
+            f"{escape(body)}\n\n"
+            f"Chat: <code>{escape(chat_id)}</code>"
+        )
+        sent = False
+        for admin_id in sorted(recipients):
+            try:
+                await self.bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+                sent = True
+            except TelegramAPIError:
+                logger.exception(
+                    "Could not send system alert to admin %s",
+                    admin_id,
+                )
+        return sent
 
     async def notify_decision(
         self,
@@ -62,10 +110,12 @@ class AdminNotifier:
         ):
             return False
 
-        if not self.admin_ids:
-            return False
-
         current = context.current_message
+
+        recipients = await self._recipients_for_chat(current.chat_id)
+
+        if not recipients:
+            return False
 
         displayed_action = (
             effective_action
@@ -212,7 +262,7 @@ class AdminNotifier:
 
         sent = False
 
-        for admin_id in self.admin_ids:
+        for admin_id in sorted(recipients):
             try:
                 await self.bot.send_message(
                     chat_id=admin_id,

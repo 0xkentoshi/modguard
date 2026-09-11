@@ -13,6 +13,7 @@ from app.admin.control_models import (
     ChatControlSettingsRecord,
     ChatEnforcementSettingsRecord,
     ChatMuteSettingsRecord,
+    ChatReputationSettingsRecord,
     ChatMigrationRecord,
     ChatRaidSettingsRecord,
     CommunityPolicyDraftRecord,
@@ -22,6 +23,7 @@ from app.admin.control_models import (
     ModerationTicketRecord,
     ModeratorFeedbackRecord,
     ModerationBanRecord,
+    ModerationImmunityRecord,
     RaidIncidentRecord,
     SemanticObservationRecord,
     TestArtifactRecord,
@@ -182,6 +184,11 @@ class ControlRepository:
                     {"mute_duration_minutes": 60},
                 )
                 await merge_pk(
+                    ChatReputationSettingsRecord,
+                    ("light_offense_decay_hours",),
+                    {"light_offense_decay_hours": 6},
+                )
+                await merge_pk(
                     ChatRaidSettingsRecord,
                     ("raid_guard_enabled",),
                     {"raid_guard_enabled": False},
@@ -211,6 +218,24 @@ class ControlRepository:
                     await session.execute(
                         update(model).where(column == old_chat_id).values({column.key: new_chat_id})
                     )
+
+                # Merge immunity entries without violating per-chat uniqueness.
+                immunity_result = await session.execute(
+                    select(ModerationImmunityRecord).where(
+                        ModerationImmunityRecord.chat_id == old_chat_id
+                    )
+                )
+                for immunity in list(immunity_result.scalars().all()):
+                    duplicate_result = await session.execute(
+                        select(ModerationImmunityRecord.id).where(
+                            ModerationImmunityRecord.chat_id == new_chat_id,
+                            ModerationImmunityRecord.subject_key == immunity.subject_key,
+                        )
+                    )
+                    if duplicate_result.scalar_one_or_none() is not None:
+                        await session.delete(immunity)
+                    else:
+                        immunity.chat_id = new_chat_id
 
                 await session.execute(
                     update(AdminDashboardStateRecord)
@@ -398,6 +423,73 @@ class ControlRepository:
                     record.shadow_mode = not record.shadow_mode
             return bool(record.shadow_mode)
 
+    async def set_shadow(self, chat_id: int, enabled: bool) -> bool:
+        """Set SHADOW deterministically; used by the safety circuit breaker."""
+        chat_id = await self.resolve_chat_id(chat_id)
+        async with self.session_factory() as session:
+            async with session.begin():
+                record = await session.get(ChatControlSettingsRecord, chat_id)
+                if record is None:
+                    record = ChatControlSettingsRecord(
+                        chat_id=chat_id,
+                        shadow_mode=bool(enabled),
+                    )
+                    session.add(record)
+                else:
+                    record.shadow_mode = bool(enabled)
+                    record.updated_at = utcnow()
+            return bool(record.shadow_mode)
+
+    async def ensure_reputation_settings(
+        self,
+        *,
+        chat_id: int,
+    ) -> ChatReputationSettingsRecord:
+        chat_id = await self.resolve_chat_id(chat_id)
+        async with self.session_factory() as session:
+            async with session.begin():
+                record = await session.get(ChatReputationSettingsRecord, chat_id)
+                if record is None:
+                    record = ChatReputationSettingsRecord(
+                        chat_id=chat_id,
+                        light_offense_decay_hours=6,
+                    )
+                    session.add(record)
+            return record
+
+    async def get_light_offense_decay_hours(
+        self,
+        chat_id: int,
+    ) -> int:
+        record = await self.ensure_reputation_settings(chat_id=chat_id)
+        return int(record.light_offense_decay_hours)
+
+    async def set_light_offense_decay_hours(
+        self,
+        chat_id: int,
+        hours: int,
+    ) -> int:
+        # 0 = never expire LIGHT history. Keep a small, understandable preset set.
+        allowed = {0, 1, 3, 6, 12, 24, 72, 168}
+        hours = int(hours)
+        if hours not in allowed:
+            raise ValueError("Unsupported light offense decay window")
+
+        chat_id = await self.resolve_chat_id(chat_id)
+        async with self.session_factory() as session:
+            async with session.begin():
+                record = await session.get(ChatReputationSettingsRecord, chat_id)
+                if record is None:
+                    record = ChatReputationSettingsRecord(
+                        chat_id=chat_id,
+                        light_offense_decay_hours=hours,
+                    )
+                    session.add(record)
+                else:
+                    record.light_offense_decay_hours = hours
+                    record.updated_at = utcnow()
+            return int(record.light_offense_decay_hours)
+
     async def ensure_enforcement_settings(
         self,
         *,
@@ -502,6 +594,120 @@ class ControlRepository:
                     record.mute_duration_minutes = minutes
                     record.updated_at = utcnow()
             return int(record.mute_duration_minutes)
+
+    @staticmethod
+    def _immunity_subject_key(*, user_id: int | None, username: str | None) -> str:
+        if user_id is not None:
+            return f"id:{int(user_id)}"
+        normalized = (username or "").strip().lstrip("@").casefold()
+        if not normalized:
+            raise ValueError("Immunity entry requires a Telegram user ID or @username.")
+        return f"username:{normalized}"
+
+    async def add_moderation_immunity(
+        self,
+        *,
+        chat_id: int,
+        user_id: int | None = None,
+        username: str | None = None,
+        created_by_admin_id: int | None = None,
+    ) -> ModerationImmunityRecord:
+        chat_id = await self.resolve_chat_id(chat_id)
+        clean_username = (username or "").strip().lstrip("@") or None
+        subject_key = self._immunity_subject_key(
+            user_id=user_id,
+            username=clean_username,
+        )
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                statement = select(ModerationImmunityRecord).where(
+                    ModerationImmunityRecord.chat_id == chat_id,
+                    ModerationImmunityRecord.subject_key == subject_key,
+                )
+                result = await session.execute(statement)
+                record = result.scalar_one_or_none()
+                if record is None:
+                    record = ModerationImmunityRecord(
+                        chat_id=chat_id,
+                        subject_key=subject_key,
+                        user_id=(int(user_id) if user_id is not None else None),
+                        username=clean_username,
+                        created_by_admin_id=created_by_admin_id,
+                    )
+                    session.add(record)
+                else:
+                    if clean_username:
+                        record.username = clean_username
+                    if user_id is not None:
+                        record.user_id = int(user_id)
+                    if created_by_admin_id is not None:
+                        record.created_by_admin_id = created_by_admin_id
+            return record
+
+    async def remove_moderation_immunity(
+        self,
+        *,
+        chat_id: int,
+        record_id: int,
+    ) -> bool:
+        chat_id = await self.resolve_chat_id(chat_id)
+        async with self.session_factory() as session:
+            async with session.begin():
+                statement = select(ModerationImmunityRecord).where(
+                    ModerationImmunityRecord.id == int(record_id),
+                    ModerationImmunityRecord.chat_id == chat_id,
+                )
+                result = await session.execute(statement)
+                record = result.scalar_one_or_none()
+                if record is None:
+                    return False
+                await session.delete(record)
+            return True
+
+    async def list_moderation_immunity(
+        self,
+        *,
+        chat_id: int,
+    ) -> list[ModerationImmunityRecord]:
+        chat_id = await self.resolve_chat_id(chat_id)
+        async with self.session_factory() as session:
+            statement = (
+                select(ModerationImmunityRecord)
+                .where(ModerationImmunityRecord.chat_id == chat_id)
+                .order_by(ModerationImmunityRecord.id.asc())
+            )
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
+    async def is_moderation_immune(
+        self,
+        *,
+        chat_id: int,
+        user_id: int | None,
+        username: str | None,
+    ) -> bool:
+        chat_id = await self.resolve_chat_id(chat_id)
+        clauses = []
+        if user_id is not None:
+            clauses.append(ModerationImmunityRecord.user_id == int(user_id))
+        clean_username = (username or "").strip().lstrip("@").casefold()
+        if clean_username:
+            clauses.append(func.lower(ModerationImmunityRecord.username) == clean_username)
+        if not clauses:
+            return False
+
+        async with self.session_factory() as session:
+            statement = (
+                select(ModerationImmunityRecord.id)
+                .where(
+                    ModerationImmunityRecord.chat_id == chat_id,
+                    or_(*clauses),
+                )
+                .limit(1)
+            )
+            result = await session.execute(statement)
+            return result.scalar_one_or_none() is not None
 
     async def get_active_community_policy(
         self,
@@ -1298,6 +1504,13 @@ class ControlRepository:
                         state.view = view
                     state.updated_at = utcnow()
             return state
+
+    async def clear_dashboard_state(self, admin_id: int) -> None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                state = await session.get(AdminDashboardStateRecord, int(admin_id))
+                if state is not None:
+                    await session.delete(state)
 
     async def dashboard_states_for_chat(
         self, *, chat_id: int, view: str = "dashboard"

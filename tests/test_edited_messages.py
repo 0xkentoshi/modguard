@@ -38,8 +38,8 @@ async def test_edit_can_use_unix_timestamp(
 
     await repository.upsert_message(
         telegram_message_id=11,
-        chat_id=-1002223334445,
-        user_id=123456789,
+        chat_id=-1004326214219,
+        user_id=653133067,
         username="@tester",
         full_name="Tester",
         chat_title="ModGuard Sandbox",
@@ -52,13 +52,14 @@ async def test_edit_can_use_unix_timestamp(
         telegram_date=original_date,
     )
 
-    # Telegram may provide edited-message timestamps as Unix integers.
+    # Именно такой тип пришёл у тебя
+    # при Telegram edited_message.
     edit_timestamp = 1788796770
 
     await repository.upsert_message(
         telegram_message_id=11,
-        chat_id=-1002223334445,
-        user_id=123456789,
+        chat_id=-1004326214219,
+        user_id=653133067,
         username="@tester",
         full_name="Tester",
         chat_title="ModGuard Sandbox",
@@ -78,7 +79,7 @@ async def test_edit_can_use_unix_timestamp(
     )
 
     record = await repository.get_message(
-        chat_id=-1002223334445,
+        chat_id=-1004326214219,
         telegram_message_id=11,
     )
 

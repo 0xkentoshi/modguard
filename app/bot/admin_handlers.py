@@ -71,14 +71,38 @@ async def safe_callback_answer(
             return False
         raise
 
-def allowed(
+async def allowed(
     user_id: int,
     settings: Settings,
+    pilot_access_service=None,
 ) -> bool:
-    return (
-        user_id
-        in settings.admin_id_list
-    )
+    if user_id in settings.admin_id_list:
+        return True
+    if pilot_access_service is None:
+        return False
+    try:
+        return bool(await pilot_access_service.is_authorized(user_id))
+    except Exception:
+        logger.exception("Pilot authorization failed | user=%s", user_id)
+        return False
+
+
+async def can_access_chat(
+    user_id: int,
+    chat_id: int,
+    pilot_access_service=None,
+) -> bool:
+    if pilot_access_service is None:
+        return True
+    try:
+        return bool(await pilot_access_service.can_access_chat(user_id, chat_id))
+    except Exception:
+        logger.exception(
+            "Pilot chat authorization failed | user=%s | chat=%s",
+            user_id,
+            chat_id,
+        )
+        return False
 
 
 async def remove_stale_dashboard_copy(
@@ -140,12 +164,24 @@ async def start_private(
     message: Message,
     dashboard_service: DashboardService,
     app_settings: Settings,
+    pilot_access_service=None,
 ) -> None:
+    if message.from_user and pilot_access_service is not None:
+        try:
+            await pilot_access_service.record_user(
+                user_id=message.from_user.id,
+                username=message.from_user.username,
+                full_name=message.from_user.full_name,
+            )
+        except Exception:
+            logger.exception("Could not record Pilot user")
+
     if (
         not message.from_user
-        or not allowed(
+        or not await allowed(
             message.from_user.id,
             app_settings,
+            pilot_access_service,
         )
     ):
         await message.answer(
@@ -166,12 +202,14 @@ async def dashboard_command(
     message: Message,
     dashboard_service: DashboardService,
     app_settings: Settings,
+    pilot_access_service=None,
 ) -> None:
     if (
         not message.from_user
-        or not allowed(
+        or not await allowed(
             message.from_user.id,
             app_settings,
+            pilot_access_service,
         )
     ):
         return
@@ -218,12 +256,15 @@ async def admin_callback(
     raid_guard_service: RaidGuardService,
     moderation_executor: ModerationExecutor,
     app_settings: Settings,
+    safety_circuit=None,
+    pilot_access_service=None,
 ) -> None:
     if (
         not callback.from_user
-        or not allowed(
+        or not await allowed(
             callback.from_user.id,
             app_settings,
+            pilot_access_service,
         )
     ):
         await callback.answer(
@@ -243,6 +284,31 @@ async def admin_callback(
 
     action = parts[1]
     admin_id = callback.from_user.id
+
+    # Most chat-scoped callbacks carry the Telegram chat id in parts[2].
+    # Negative ids are Telegram group/supergroup ids; protect them centrally
+    # for dynamically granted Pilot renters. Resource-id callbacks are checked
+    # again when their record is loaded below.
+    if pilot_access_service is not None and len(parts) > 2:
+        try:
+            candidate_chat_id = int(parts[2])
+        except (TypeError, ValueError):
+            candidate_chat_id = None
+        if (
+            candidate_chat_id is not None
+            and candidate_chat_id < 0
+            and not await can_access_chat(
+                admin_id,
+                candidate_chat_id,
+                pilot_access_service,
+            )
+        ):
+            await safe_callback_answer(
+                callback,
+                "Not authorized for this community.",
+                show_alert=True,
+            )
+            return
 
     # First admin interaction after restart also repairs any Telegram
     # basic-group -> supergroup aliases left by older ModGuard versions.
@@ -543,7 +609,7 @@ async def admin_callback(
         elif action == "chats":
             text, keyboard = (
                 await dashboard_service
-                .chats_payload()
+                .chats_payload(admin_id=admin_id)
             )
 
             state = (
@@ -776,14 +842,118 @@ async def admin_callback(
                 view="settings",
             )
 
+        elif action == "tools":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.tools_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="tools",
+            )
+            await callback.answer("Safety & tools")
+            return
+
+        elif action == "light_memory":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.light_memory_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="light_memory",
+            )
+            await callback.answer("Light offense memory")
+            return
+
+        elif action == "light_memory_set":
+            chat_id = int(parts[2])
+            hours = int(parts[3])
+            applied = await control_repository.set_light_offense_decay_hours(
+                chat_id, hours
+            )
+            text, keyboard = await dashboard_service.light_memory_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="light_memory",
+            )
+            label = "never" if applied <= 0 else f"{applied}h"
+            await callback.answer(f"Light memory: {label}")
+            return
+
+        elif action == "immune":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.immunity_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="immunity",
+            )
+            await callback.answer("Immunity list")
+            return
+
+        elif action == "immune_add":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.immunity_input_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="immunity_input",
+            )
+            await callback.answer("Send @username or ID")
+            return
+
+        elif action == "immune_del":
+            chat_id = int(parts[2])
+            record_id = int(parts[3])
+            removed = await control_repository.remove_moderation_immunity(
+                chat_id=chat_id,
+                record_id=record_id,
+            )
+            text, keyboard = await dashboard_service.immunity_payload(
+                chat_id=chat_id,
+                status=("Immunity removed" if removed else "Entry already removed"),
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="immunity",
+            )
+            await callback.answer("Updated")
+            return
+
         elif action == "shadow":
             chat_id = int(
                 parts[2]
             )
 
-            await control_repository.toggle_shadow(
+            shadow_enabled = await control_repository.toggle_shadow(
                 chat_id
             )
+            if not shadow_enabled and safety_circuit is not None:
+                # Human explicitly re-enabled LIVE/DRY behavior after review.
+                safety_circuit.reset_runtime_counters(chat_id)
 
             text, keyboard = (
                 await dashboard_service
@@ -907,6 +1077,9 @@ async def admin_callback(
                 )
                 return
             text, keyboard, chat_id = payload
+            if not await can_access_chat(admin_id, chat_id, pilot_access_service):
+                await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
+                return
             await dashboard_service.render(
                 admin_id=admin_id,
                 text=text,
@@ -919,6 +1092,13 @@ async def admin_callback(
 
         elif action == "raid_unban":
             incident_id = int(parts[2])
+            incident = await control_repository.get_raid_incident(incident_id)
+            if incident is None:
+                await safe_callback_answer(callback, "Raid incident not found.", show_alert=True)
+                return
+            if not await can_access_chat(admin_id, incident.chat_id, pilot_access_service):
+                await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
+                return
             unbanned, failed = await raid_guard_service.unban_incident_users(
                 incident_id=incident_id
             )
@@ -964,13 +1144,13 @@ async def admin_callback(
                 managed_chat_id=chat_id,
                 kind="shadow_alert",
             )
-            text, keyboard = await dashboard_service.settings_payload(chat_id=chat_id)
+            text, keyboard = await dashboard_service.tools_payload(chat_id=chat_id)
             await dashboard_service.render(
                 admin_id=admin_id,
                 text=text,
                 keyboard=keyboard,
                 selected_chat_id=chat_id,
-                view="settings",
+                view="tools",
             )
             await callback.answer(f"Cleared {deleted} shadow alert(s)")
             return
@@ -1009,6 +1189,9 @@ async def admin_callback(
             record = await control_repository.get_moderation_ban(ban_id)
             if record is None or not record.active:
                 await callback.answer("Ban record is no longer active.", show_alert=True)
+                return
+            if not await can_access_chat(admin_id, record.chat_id, pilot_access_service):
+                await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
                 return
 
             try:
@@ -1135,6 +1318,10 @@ async def admin_callback(
                 chat_id,
             ) = payload
 
+            if not await can_access_chat(admin_id, chat_id, pilot_access_service):
+                await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
+                return
+
             await dashboard_service.render(
                 admin_id=admin_id,
                 text=text,
@@ -1168,6 +1355,10 @@ async def admin_callback(
                     "Ticket not found.",
                     show_alert=True,
                 )
+                return
+
+            if not await can_access_chat(admin_id, ticket.chat_id, pilot_access_service):
+                await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
                 return
 
             if is_test_ticket(ticket):
@@ -1400,15 +1591,27 @@ async def community_policy_text_input(
     control_repository: ControlRepository,
     community_policy_service: CommunityPolicyService,
     app_settings: Settings,
+    pilot_access_service=None,
 ) -> None:
     if (
         not message.from_user
-        or not allowed(
+        or not await allowed(
             message.from_user.id,
             app_settings,
+            pilot_access_service,
         )
     ):
         return
+
+    # Optional private Pilot Ops input flow (grant/search/etc.). The public
+    # repository only exposes this hook; the implementation lives in the
+    # git-ignored private_ops package.
+    if pilot_access_service is not None and message.from_user is not None:
+        try:
+            if await pilot_access_service.handle_private_text(message):
+                return
+        except Exception:
+            logger.exception("Pilot Ops text handler failed")
 
     # Command handlers above own slash commands.
     if (
@@ -1427,6 +1630,10 @@ async def community_policy_text_input(
 
     chat_id = int(state.selected_chat_id)
 
+    if not await can_access_chat(admin_id, chat_id, pilot_access_service):
+        await control_repository.clear_dashboard_state(admin_id)
+        return
+
     if state.view == "bans_search":
         text, keyboard = await dashboard_service.bans_search_results_payload(
             chat_id=chat_id,
@@ -1443,6 +1650,60 @@ async def community_policy_text_input(
             await message.delete()
         except Exception:
             logger.debug("Could not delete ban search input.", exc_info=True)
+        return
+
+    if state.view == "immunity_input":
+        raw = (message.text or "").strip()
+        try:
+            if raw.lstrip("-").isdigit() and not raw.startswith("-"):
+                user_id = int(raw)
+                if user_id <= 0:
+                    raise ValueError("Telegram user ID must be a positive integer.")
+                await control_repository.add_moderation_immunity(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    created_by_admin_id=admin_id,
+                )
+                status = f"Added ID {user_id}"
+            else:
+                username = raw.lstrip("@").strip()
+                if not username or any(ch.isspace() for ch in username):
+                    raise ValueError("Send one @username or numeric Telegram user ID.")
+                await control_repository.add_moderation_immunity(
+                    chat_id=chat_id,
+                    username=username,
+                    created_by_admin_id=admin_id,
+                )
+                status = f"Added @{username}"
+
+            text, keyboard = await dashboard_service.immunity_payload(
+                chat_id=chat_id,
+                status=status,
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="immunity",
+            )
+        except Exception as exc:
+            text, keyboard = await dashboard_service.immunity_input_payload(
+                chat_id=chat_id,
+                error=str(exc),
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="immunity_input",
+            )
+        finally:
+            try:
+                await message.delete()
+            except Exception:
+                logger.debug("Could not delete immunity input message.", exc_info=True)
         return
 
     if state.view != "policy_input":

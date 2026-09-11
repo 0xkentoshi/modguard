@@ -1,44 +1,21 @@
-# Python
 .venv/
-venv/
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-.pytest_cache/
-.coverage
-htmlcov/
 
-# Secrets and local configuration
 .env
-.env.*
-!.env.example
 
-# Runtime data
 *.db
 *.sqlite
 *.sqlite3
-data/
-logs/
-backups/
-*.log
 
-# Local patch / QA artifacts
-.patch_backups/
-_modguard_patch_backups/
-_backup_*/
-APPLY_PATCH*.ps1
-PATCH_MANIFEST*
-SHA256SUMS*
-VALIDATION_REPORT*
-README_*PATCH*
-README_*FIX*
-LIVE_REGRESSION_*
+.pytest_cache/
+.coverage
 
-# IDE / OS
 .idea/
 .vscode/
-.DS_Store
-Thumbs.db
 
-# Archives
-*.zip
+logs/
+data/
+# Owner-only Pilot Edition control plane (never publish)
+private_ops/

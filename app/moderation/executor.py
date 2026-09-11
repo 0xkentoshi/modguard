@@ -25,6 +25,7 @@ from app.moderation.actions import (
     get_action_name,
     is_reversible,
 )
+from app.moderation.safety_circuit import SafetyCircuitBreaker
 from app.utils.alert_throttle import AdminAlertThrottle
 
 
@@ -57,6 +58,7 @@ class ModerationExecutor:
         dashboard_service: DashboardService | None = None,
         notify_autonomous_actions: bool = False,
         notify_new_tickets: bool = True,
+        safety_circuit: SafetyCircuitBreaker | None = None,
     ):
         self.audit_repository = audit_repository
         self.notifier = notifier
@@ -108,6 +110,8 @@ class ModerationExecutor:
         self.notify_new_tickets = (
             notify_new_tickets
         )
+
+        self.safety_circuit = safety_circuit
 
     async def _shadow_mode(
         self,
@@ -916,6 +920,24 @@ class ModerationExecutor:
             or shadow_mode
         )
 
+        # Pilot auto-stop: before the next abnormal autonomous destructive
+        # action, force this community into persistent SHADOW. Raid Guard is a
+        # separate explicit subsystem and does not pass through this per-message
+        # circuit.
+        if (
+            not effective_dry_run
+            and self.safety_circuit is not None
+            and policy.autonomous
+            and policy.final_action in {"delete", "mute", "ban"}
+        ):
+            allowed = await self.safety_circuit.preflight(
+                chat_id=current.chat_id,
+                planned_action=policy.final_action,
+            )
+            if not allowed:
+                shadow_mode = True
+                effective_dry_run = True
+
         ban_attempted = False
         ban_success = None
         ban_error = None
@@ -1132,6 +1154,34 @@ class ModerationExecutor:
             effective_action = None
             overall_success = None
             overall_error = None
+
+        destructive_failure = any(
+            attempted and success is False
+            for attempted, success in (
+                (ban_attempted, ban_success),
+                (mute_attempted, mute_success),
+                (delete_attempted, delete_success),
+            )
+        )
+
+        if (
+            not effective_dry_run
+            and self.safety_circuit is not None
+            and policy.autonomous
+        ):
+            try:
+                await self.safety_circuit.record_execution(
+                    chat_id=current.chat_id,
+                    action=effective_action,
+                    success=overall_success,
+                    had_failure=destructive_failure,
+                )
+            except Exception:
+                # The safety layer must never crash the stable moderation path.
+                logger.exception(
+                    "Safety circuit outcome recording failed | chat=%s",
+                    current.chat_id,
+                )
 
         event = await self.audit_repository.create_event(
             chat_id=current.chat_id,
