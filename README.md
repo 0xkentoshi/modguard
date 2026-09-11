@@ -8,7 +8,7 @@
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-aiogram-26A5E4?logo=telegram&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-Ollama-black)
-![Tests](https://img.shields.io/badge/regression_tests-255-success)
+![Tests](https://img.shields.io/badge/regression_tests-253-success)
 
 **Real moderation actions · Local LLMs · Deterministic safety · Human review**
 
