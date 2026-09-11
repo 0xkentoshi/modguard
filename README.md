@@ -163,7 +163,7 @@ Safe simulations for critical moderation actions.
 - **Graceful Ctrl+C shutdown** with isolated resource cleanup
 - **Ban registry** with newest-first pagination, search and unban
 - **Diagnostics** for Telegram, database, Ollama, Fast/Deep LLMs and embeddings
-- **255 automated regression tests**
+- **253 automated regression tests**
 
 ---
 
