@@ -378,25 +378,132 @@ class ModerationExecutor:
             )
             policy_label = f"policy {version} · {rules}"
 
+        relationship = context.relationship_signals
+        relationship_line = ""
+        if (
+            relationship.counterpart_user_id is not None
+            and relationship.familiarity != "none"
+        ):
+            relationship_line = (
+                "\n<b>Familiarity:</b> "
+                f"{html.escape(relationship.familiarity)} · "
+                f"{relationship.total_pair_replies} observed mutual replies"
+            )
+
         text = (
             f"🛡 <b>SHADOW · WOULD {html.escape(action)}</b>\n"
             f"{html.escape(who)} · {html.escape(policy_label)} · "
             f"{decision.confidence:.0%}\n\n"
-            f"<code>{html.escape(snippet)}</code>"
+            f"<code>{html.escape(snippet)}</code>\n\n"
+            f"<b>Why:</b> {html.escape(decision.reason[:500])}"
+            f"{relationship_line}"
         )
 
         if suppressed:
             text += f"\n\nSuppressed similar alerts: {suppressed}"
 
-        sent = False
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="🧹 Clear shadow alerts",
-                callback_data=f"mg:shadow_clear:{current.chat_id}",
-            )]
-        ])
+        shadow_case = None
+        if self.control_repository is not None:
+            try:
+                shadow_case = (
+                    await self.control_repository.create_shadow_feedback_case(
+                        chat_id=current.chat_id,
+                        telegram_message_id=current.telegram_message_id,
+                        target_user_id=current.user_id,
+                        counterpart_user_id=(
+                            context.reply_target_message.user_id
+                            if context.reply_target_message is not None
+                            else None
+                        ),
+                        username=current.username,
+                        message_text=current.raw_text,
+                        context={
+                            "recent_chat_messages": [
+                                {
+                                    "user_id": item.user_id,
+                                    "username": item.username,
+                                    "text": item.raw_text,
+                                    "reply_to_message_id": item.reply_to_message_id,
+                                }
+                                for item in context.recent_chat_messages[-8:]
+                                if item.raw_text.strip()
+                            ],
+                            "reply_target": (
+                                {
+                                    "user_id": context.reply_target_message.user_id,
+                                    "username": context.reply_target_message.username,
+                                    "text": context.reply_target_message.raw_text,
+                                }
+                                if context.reply_target_message is not None
+                                else None
+                            ),
+                            "relationship_signals": relationship.model_dump(),
+                            "policy_source": policy.source,
+                            "matched_community_rules": policy.matched_community_rules,
+                        },
+                        ai_action=policy.final_action,
+                        ai_category=decision.category,
+                        ai_severity=decision.severity,
+                        ai_confidence=decision.confidence,
+                        ai_reason=decision.reason,
+                        policy_version=policy.community_policy_version,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist Shadow feedback case | chat=%s | message=%s",
+                    current.chat_id,
+                    current.telegram_message_id,
+                )
 
-        for admin_id in self.dashboard_service.admin_ids:
+        keyboard_rows = []
+        if shadow_case is not None:
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="✅ Agree",
+                        callback_data=f"mg:sagree:{shadow_case.id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Disagree",
+                        callback_data=f"mg:sdisagree:{shadow_case.id}",
+                    ),
+                ]
+            )
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🧹 Clear shadow alerts",
+                    callback_data=f"mg:shadow_clear:{current.chat_id}",
+                )
+            ]
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=keyboard_rows
+        )
+
+        recipients = set(self.dashboard_service.admin_ids)
+        access_service = getattr(
+            self.dashboard_service,
+            "access_service",
+            None,
+        )
+        if access_service is not None:
+            try:
+                recipients.update(
+                    int(item)
+                    for item in await access_service.notification_recipients(
+                        current.chat_id
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Could not resolve Shadow feedback recipients | chat=%s",
+                    current.chat_id,
+                )
+
+        sent = False
+        for admin_id in sorted(recipients):
             try:
                 message = await self.dashboard_service.bot.send_message(
                     chat_id=admin_id,

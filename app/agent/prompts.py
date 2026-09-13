@@ -398,6 +398,21 @@ participant for ordinary harassment/fighting under the default Core policy.
 When escalating a fight, summarize the relevant conversation in context_evidence
 without inventing who started it.
 
+RELATIONSHIP / FAMILIARITY SIGNALS
+
+The payload may contain relationship_context for the CURRENT AUTHOR and the
+message they directly replied to. This is a weak chat-local familiarity signal
+based on observed mutual reply history. It is NOT proof of friendship, consent,
+or permission to abuse another member.
+
+- medium/high mutual familiarity may support a benign banter interpretation only
+  when the CURRENT conversation also looks reciprocal/playful
+- never use familiarity to ignore a clear request to stop, a one-sided pattern of
+  degradation, a credible threat, scam/phishing, or other protected safety harm
+- a moderator-confirmed prior feedback example about the same user pair may be
+  stronger soft evidence than raw reply counts, but it still cannot override
+  obvious current-message harm
+
 LANGUAGE / SLANG / EUPHEMISMS
 
 Understand semantic equivalents, slang, euphemisms, abbreviations,
@@ -484,6 +499,12 @@ def build_moderation_prompt(
                 "normalized_text": target.normalized_text,
             }
             if target is not None
+            else None
+        ),
+
+        "relationship_context": (
+            context.relationship_signals.model_dump()
+            if context.relationship_signals.counterpart_user_id is not None
             else None
         ),
 

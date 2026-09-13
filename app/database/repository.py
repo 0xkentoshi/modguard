@@ -3,8 +3,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from app.database.models import (
     MessageRecord,
@@ -138,6 +139,62 @@ class MessageRepository:
             records = list(result.scalars().all())
             records.reverse()
             return records
+
+    async def get_pair_reply_counts(
+        self,
+        *,
+        chat_id: int,
+        user_a_id: int,
+        user_b_id: int,
+    ) -> tuple[int, int]:
+        """
+        Count observed direct replies between two users in this chat.
+
+        This is only a familiarity signal. A large count is not treated as
+        proof of friendship or consent to abuse.
+        """
+
+        if user_a_id == user_b_id:
+            return 0, 0
+
+        child = aliased(MessageRecord)
+        parent = aliased(MessageRecord)
+
+        async with self.session_factory() as session:
+            async def count_direction(
+                source_user_id: int,
+                target_user_id: int,
+            ) -> int:
+                statement = (
+                    select(func.count(child.id))
+                    .select_from(child)
+                    .join(
+                        parent,
+                        and_(
+                            parent.chat_id == child.chat_id,
+                            parent.telegram_message_id
+                            == child.reply_to_message_id,
+                        ),
+                    )
+                    .where(
+                        child.chat_id == chat_id,
+                        child.user_id == source_user_id,
+                        parent.user_id == target_user_id,
+                    )
+                )
+                result = await session.execute(statement)
+                return int(result.scalar_one() or 0)
+
+            a_to_b = await count_direction(
+                user_a_id,
+                user_b_id,
+            )
+            b_to_a = await count_direction(
+                user_b_id,
+                user_a_id,
+            )
+
+        return a_to_b, b_to_a
 
     async def get_recent_user_messages(
         self,

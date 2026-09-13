@@ -76,6 +76,30 @@ class BehaviorSignals(BaseModel):
     is_forwarded: bool = False
 
 
+
+
+class RelationshipSignals(BaseModel):
+    """
+    Weak, chat-local familiarity evidence for the current author and reply target.
+
+    This is deliberately NOT a friendship verdict. It only summarizes observed
+    mutual reply history so the moderator can distinguish established banter
+    from a first-time hostile interaction when the current context supports it.
+    """
+
+    counterpart_user_id: int | None = None
+    replies_current_to_counterpart: int = Field(default=0, ge=0)
+    replies_counterpart_to_current: int = Field(default=0, ge=0)
+    total_pair_replies: int = Field(default=0, ge=0)
+    mutual: bool = False
+    familiarity: Literal[
+        "none",
+        "low",
+        "medium",
+        "high",
+    ] = "none"
+
+
 class ModerationHistoryItem(BaseModel):
     event_key: str
     action: str
@@ -104,6 +128,10 @@ class MessageContext(BaseModel):
 
     user_moderation_history: list[ModerationHistoryItem] = Field(
         default_factory=list
+    )
+
+    relationship_signals: RelationshipSignals = Field(
+        default_factory=RelationshipSignals
     )
 
     # LIGHT offense reputation window for this community. 0 means no decay.

@@ -289,6 +289,21 @@ class DashboardService:
         settings = await self.repository.get_chat_settings(chat_id)
         summary = await self.repository.get_activity_summary(chat_id=chat_id, hours=24)
         tickets = await self.repository.count_open_tickets(chat_id)
+        feedback_reader = getattr(
+            self.repository,
+            "shadow_feedback_stats",
+            None,
+        )
+        if callable(feedback_reader):
+            shadow_feedback = await feedback_reader(
+                chat_id=chat_id
+            )
+        else:
+            shadow_feedback = {
+                "confirmed": 0,
+                "agreed": 0,
+                "corrected": 0,
+            }
         title = await self._chat_title(chat_id)
 
         if settings.shadow_mode:
@@ -298,12 +313,26 @@ class DashboardService:
         else:
             mode = "DRY RUN"
 
+        feedback_line = ""
+        if shadow_feedback["confirmed"]:
+            agreement = (
+                shadow_feedback["agreed"]
+                / shadow_feedback["confirmed"]
+            )
+            feedback_line = (
+                "\nShadow feedback "
+                f"{shadow_feedback['confirmed']} · "
+                f"agreement {agreement:.0%} · "
+                f"corrected {shadow_feedback['corrected']}"
+            )
+
         text = (
             "<b>🛡 MODGUARD</b>\n"
             f"{esc(title)} · <b>{mode}</b>\n\n"
             "<b>24h</b>\n"
             f"Deleted {summary.deleted} · Banned {summary.banned} · Muted {summary.muted} · Warned {summary.warned}\n"
             f"Tickets {tickets} · Reviews {summary.reviews}"
+            f"{feedback_line}"
         )
 
         keyboard = InlineKeyboardMarkup(
