@@ -4,12 +4,11 @@
 
 ### Local-first AI moderation agent for Telegram communities
 
-![Version](https://img.shields.io/badge/version-1.2.0-111111)
+![Version](https://img.shields.io/badge/version-1.3.0-111111)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-aiogram-26A5E4?logo=telegram&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-Ollama-black)
-![Tests](https://img.shields.io/badge/regression_tests-253-success)
-[![CI](https://github.com/0xkentoshi/modguard/actions/workflows/ci.yml/badge.svg)](https://github.com/0xkentoshi/modguard/actions/workflows/ci.yml)
+![Tests](https://img.shields.io/badge/regression_tests-259-success)
 
 **Real moderation actions · Local LLMs · Deterministic safety · Human review**
 
@@ -146,7 +145,7 @@ Safe simulations for critical moderation actions.
 - **Progressive enforcement** for spam and flood
 - **Human-review tickets** for ambiguous fights and contextual harassment
 - **Natural-language Community Policy** with per-chat rules
-- **Shadow Mode** for safe dry evaluation before live enforcement
+- **Adaptive Shadow Mode** for safe dry evaluation plus moderator calibration before live enforcement
 - **Auto-ban kill switch** with temporary-mute fallback
 - **Immunity List** for trusted bots and service accounts by Telegram username or user ID
 - **Fake Admin / Moderator protection** using real Telegram roles, identity similarity and dangerous-behavior signals
@@ -154,7 +153,9 @@ Safe simulations for critical moderation actions.
 - **Time-aware reputation decay** for minor spam, flood and harassment offenses with a configurable window
 - **Semantic campaign detection** using local embeddings
 - **Raid Guard** for confirmed multi-user hostile campaigns
+- **Adaptive Shadow Feedback** with Agree / Disagree, free-text correction, explicit confirmation and chat-scoped soft memory
 - **Moderator Feedback Memory** for chat-scoped gray-area decisions
+- **Lightweight relationship context** from observed bidirectional reply history; treated only as a weak familiarity signal
 - **Known Pattern Memory** for repeated confirmed malicious payloads
 - **Multi-community isolation** with independent settings and policies
 - **Telegram group → supergroup migration recovery**
@@ -163,7 +164,7 @@ Safe simulations for critical moderation actions.
 - **Graceful Ctrl+C shutdown** with isolated resource cleanup
 - **Ban registry** with newest-first pagination, search and unban
 - **Diagnostics** for Telegram, database, Ollama, Fast/Deep LLMs and embeddings
-- **253 automated regression tests**
+- **259 automated regression tests**
 
 ---
 
@@ -186,8 +187,11 @@ flowchart TD
     EXEC --> MUTE[Mute]
     EXEC --> BAN[Ban]
     EXEC --> REVIEW[Human Review Ticket]
+    EXEC --> SHADOW[Shadow Decision]
 
     REVIEW --> FEEDBACK[Moderator Feedback Memory]
+    SHADOW --> SFB[Agree / Disagree]
+    SFB -->|confirmed correction| FEEDBACK
 
     EXEC --> AUDIT[(SQLite Audit / State)]
     AUDIT --> DASH[Admin Control Center]
@@ -202,6 +206,32 @@ flowchart TD
 A deeper architecture breakdown is available in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
+
+## Adaptive Shadow Feedback
+
+Shadow Mode can now be used as a calibration loop before live enforcement. Each Shadow alert exposes only two first-step choices: **Agree** or **Disagree**.
+
+If a moderator disagrees, ModGuard asks for a normal free-text explanation of what was wrong and what should happen instead. Deep AI converts that explanation into a structured correction and shows a preview. **Nothing is learned until the moderator explicitly saves the correction.**
+
+Confirmed feedback becomes **community-scoped soft memory** for similar gray-area cases. The stable moderation Core, hard-safety categories and Community Policy keep priority over learned feedback.
+
+For reply-based conflicts ModGuard also tracks a lightweight pair-familiarity signal from observed bidirectional replies. This signal can help interpret recurring banter, but it is **not proof of friendship, consent or permission to ignore current abuse**.
+
+```text
+Shadow decision
+      ↓
+Agree ───────────────→ confirmed local precedent
+
+Disagree
+      ↓
+free-text moderator explanation
+      ↓
+Deep AI interpretation
+      ↓
+preview → Save / Clarify / Cancel
+      ↓
+community-scoped feedback memory
+```
 
 ## Safety Model
 
@@ -230,7 +260,10 @@ Human conflict is intentionally more conservative:
 
 ### Additional safety controls
 
-- **Shadow Mode:** observe decisions without destructive actions
+- **Shadow Mode:** observe decisions without destructive actions and collect explicit moderator feedback
+- **Feedback confirmation:** disagreement text is inert until the moderator confirms the parsed correction
+- **Hard-safety precedence:** historical feedback cannot soften protected scam, phishing, malicious-link or threat decisions into `ALLOW`
+- **Relationship signal is weak context:** reply familiarity never overrides a current request to stop, one-sided abuse or hard-safety evidence
 - **Auto-ban OFF:** a BAN verdict falls back to temporary mute + delete
 - **Current-message evidence:** history cannot make a harmless current message guilty
 - **Semantic clustering is observational:** similarity alone cannot punish a message
@@ -247,6 +280,7 @@ Human conflict is intentionally more conservative:
 ModGuard exposes an inline Telegram admin interface for each managed community:
 
 - Dashboard and 24h activity
+- Shadow feedback metrics: confirmed cases, agreement rate and corrections
 - Open review tickets
 - Shadow / Live mode
 - Auto-ban switch
@@ -361,7 +395,7 @@ Run the regression suite:
 python -m pytest -v
 ```
 
-The suite covers policy boundaries, false-positive guards, report re-review, community policies, moderation actions, semantic clustering, Raid Guard, feedback memory, chat migration, Test Mode, admin controls, immunity rules, fake-admin protection, safety-circuit behavior and reputation decay.
+The suite covers policy boundaries, false-positive guards, report re-review, community policies, moderation actions, semantic clustering, Raid Guard, feedback memory, chat migration, Test Mode, admin controls, immunity rules, fake-admin protection, safety-circuit behavior, reputation decay and Adaptive Shadow feedback.
 
 See [`docs/TESTING.md`](docs/TESTING.md) for the testing philosophy.
 
@@ -407,6 +441,8 @@ Key engineering problems addressed:
 - current-message vs historical-context separation
 - deterministic enforcement policy
 - human-in-the-loop escalation
+- moderator-driven Shadow calibration with explicit confirmation
+- weak relationship/familiarity signals without treating them as permission to abuse
 - async Telegram actions
 - per-community state isolation
 - semantic campaign detection without semantic overreach
@@ -420,16 +456,29 @@ Key engineering problems addressed:
 
 ## Releases
 
+### v1.3.0 — Adaptive Shadow Feedback
+
+Current public release focused on calibrating ModGuard safely on real community traffic before enabling live enforcement:
+
+- Agree / Disagree controls on Shadow decisions
+- Free-text moderator correction instead of fixed feedback categories
+- Deep AI interpretation with **Save / Clarify / Cancel** confirmation
+- Community-scoped soft memory for confirmed Shadow feedback
+- Lightweight reply-pair familiarity context for recurring interpersonal cases
+- Hard-safety precedence so learned feedback cannot weaken protected security categories
+- Shadow feedback quality metrics in the dashboard
+- Expanded public regression coverage: **259 tests**
+
 ### v1.2.0 — Safety & Identity Protection
 
-Current public release focused on real-world pilot safety:
+Focused on real-world pilot safety:
 
 - Immunity List for trusted bots and service accounts
 - Fake Admin / Fake Moderator detection
 - Automatic per-community Safety Circuit Breaker
 - Configurable reputation decay for minor offenses
 - Cleaner separation between everyday Settings and Safety & Tools
-- Expanded public regression coverage: **253 tests**
+- Expanded public regression coverage: **255 tests**
 
 ### v1.0.1 — Portfolio Release
 

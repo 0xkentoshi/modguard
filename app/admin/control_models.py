@@ -326,6 +326,60 @@ class ModeratorFeedbackRecord(Base):
     )
 
 
+class ShadowFeedbackRecord(Base):
+    """
+    One real Shadow-mode decision awaiting or containing moderator feedback.
+
+    Confirmed rows are chat-scoped soft memory. Disagreements stay inert until
+    the moderator explicitly confirms ModGuard's parsed interpretation.
+    """
+
+    __tablename__ = "shadow_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    target_user_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    counterpart_user_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    message_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    context_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
+    ai_action: Mapped[str] = mapped_column(String(32), nullable=False)
+    ai_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ai_severity: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    ai_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True, nullable=False)
+    moderator_admin_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    review_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    moderator_explanation: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+    corrected_action: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    corrected_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    corrected_severity: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    local_rule: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    relationship_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    apply_to_same_pair: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    interpretation_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def moderator_action(self) -> str:
+        return self.corrected_action or self.ai_action
+
+    @property
+    def feedback_note(self) -> str:
+        return self.moderator_explanation
+
 
 
 class ChatRaidSettingsRecord(Base):

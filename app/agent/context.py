@@ -4,6 +4,7 @@ from app.agent.schemas import (
     MessageContext,
     MessageSnapshot,
     ModerationHistoryItem,
+    RelationshipSignals,
 )
 from app.database.models import (
     MessageRecord,
@@ -323,6 +324,68 @@ class MessageContextBuilder:
             user_history=recent_user,
         )
 
+        relationship_signals = RelationshipSignals()
+
+        if (
+            user_id is not None
+            and reply_target is not None
+            and reply_target.user_id is not None
+            and reply_target.user_id != user_id
+        ):
+            getter = getattr(
+                self.repository,
+                "get_pair_reply_counts",
+                None,
+            )
+
+            if callable(getter):
+                try:
+                    current_to_target, target_to_current = await getter(
+                        chat_id=message.chat.id,
+                        user_a_id=user_id,
+                        user_b_id=reply_target.user_id,
+                    )
+                    total_pair_replies = (
+                        current_to_target
+                        + target_to_current
+                    )
+                    mutual = bool(
+                        current_to_target > 0
+                        and target_to_current > 0
+                    )
+
+                    if (
+                        total_pair_replies >= 20
+                        and current_to_target >= 5
+                        and target_to_current >= 5
+                    ):
+                        familiarity = "high"
+                    elif (
+                        total_pair_replies >= 6
+                        and current_to_target >= 2
+                        and target_to_current >= 2
+                    ):
+                        familiarity = "medium"
+                    elif total_pair_replies >= 2:
+                        familiarity = "low"
+                    else:
+                        familiarity = "none"
+
+                    relationship_signals = RelationshipSignals(
+                        counterpart_user_id=reply_target.user_id,
+                        replies_current_to_counterpart=current_to_target,
+                        replies_counterpart_to_current=target_to_current,
+                        total_pair_replies=total_pair_replies,
+                        mutual=mutual,
+                        familiarity=familiarity,
+                    )
+                except Exception:
+                    # Familiarity is optional soft context. Moderation must
+                    # continue if the historical lookup is unavailable.
+                    relationship_signals = RelationshipSignals(
+                        counterpart_user_id=reply_target.user_id
+                    )
+
         return MessageContext(
             current_message=current,
             text_signals=text_signals,
@@ -330,5 +393,6 @@ class MessageContextBuilder:
             recent_chat_messages=recent_chat,
             recent_user_messages=recent_user,
             user_moderation_history=moderation_history,
+            relationship_signals=relationship_signals,
             reply_target_message=reply_target,
         )

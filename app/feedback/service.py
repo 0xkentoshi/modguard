@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import dataclass
 
 from app.admin.control_repository import (
     ControlRepository,
@@ -11,10 +12,13 @@ from app.agent.schemas import (
 )
 from app.feedback.prompts import (
     FEEDBACK_REVIEW_SYSTEM_PROMPT,
+    SHADOW_FEEDBACK_INTERPRET_SYSTEM_PROMPT,
     build_feedback_review_prompt,
+    build_shadow_feedback_interpret_prompt,
 )
 from app.feedback.schemas import (
     FeedbackReviewDecision,
+    ShadowFeedbackInterpretation,
 )
 from app.llm.base import LLMProvider
 from app.moderation.policy import PolicyGate
@@ -31,9 +35,26 @@ HARD_SAFETY_CATEGORIES = {
 }
 
 
+@dataclass
+class FeedbackMemoryExample:
+    id: int
+    message_text: str
+    ai_category: str | None
+    ai_reason: str
+    moderator_action: str
+    policy_version: int | None
+    created_at: object | None = None
+    source: str = "ticket"
+    moderator_note: str = ""
+    local_rule: str = ""
+    relationship_note: str = ""
+    same_pair: bool = False
+
+
 class ModeratorFeedbackService:
     """
-    Chat-scoped soft memory learned only from REAL moderator ticket decisions.
+    Chat-scoped soft memory learned from real moderator ticket decisions and
+    explicitly confirmed Shadow feedback.
 
     Stable Core always runs first.
     Explicit Community Policy is applied later and therefore keeps priority.
@@ -117,6 +138,14 @@ class ModeratorFeedbackService:
                     "warn",
                 }
             )
+            # Confirmed local feedback is allowed to calibrate LIGHT warning
+            # semantics (especially banter/harassment) even when Core itself
+            # was confident. Protected hard-safety categories are still blocked
+            # from being weakened below.
+            or (
+                policy.final_action == "warn"
+                and decision.category not in HARD_SAFETY_CATEGORIES
+            )
         )
 
     async def learn_from_ticket(
@@ -178,6 +207,122 @@ class ModeratorFeedbackService:
             )
             return False
 
+    @staticmethod
+    def _same_user_pair(
+        *,
+        context: MessageContext,
+        target_user_id: int | None,
+        counterpart_user_id: int | None,
+    ) -> bool:
+        current_user_id = context.current_message.user_id
+        reply_user_id = (
+            context.reply_target_message.user_id
+            if context.reply_target_message is not None
+            else None
+        )
+        if (
+            current_user_id is None
+            or reply_user_id is None
+            or target_user_id is None
+            or counterpart_user_id is None
+        ):
+            return False
+        return {current_user_id, reply_user_id} == {
+            target_user_id,
+            counterpart_user_id,
+        }
+
+    def _ticket_example(self, item) -> FeedbackMemoryExample:
+        return FeedbackMemoryExample(
+            id=int(item.id),
+            message_text=getattr(item, "message_text", "") or "",
+            ai_category=getattr(item, "ai_category", None),
+            ai_reason=getattr(item, "ai_reason", "") or "",
+            moderator_action=getattr(item, "moderator_action", "allow"),
+            policy_version=getattr(item, "policy_version", None),
+            created_at=getattr(item, "created_at", None),
+            source="ticket",
+        )
+
+    def _shadow_example(
+        self,
+        item,
+        *,
+        context: MessageContext,
+    ) -> FeedbackMemoryExample:
+        return FeedbackMemoryExample(
+            # Negative IDs keep source identifiers unique without changing the
+            # existing FeedbackReviewDecision schema.
+            id=-int(item.id),
+            message_text=getattr(item, "message_text", "") or "",
+            ai_category=getattr(item, "ai_category", None),
+            ai_reason=getattr(item, "ai_reason", "") or "",
+            moderator_action=getattr(item, "moderator_action", "allow"),
+            policy_version=getattr(item, "policy_version", None),
+            created_at=getattr(item, "resolved_at", None)
+            or getattr(item, "created_at", None),
+            source="shadow",
+            moderator_note=getattr(item, "moderator_explanation", "") or "",
+            local_rule=getattr(item, "local_rule", "") or "",
+            relationship_note=getattr(item, "relationship_note", "") or "",
+            same_pair=self._same_user_pair(
+                context=context,
+                target_user_id=getattr(item, "target_user_id", None),
+                counterpart_user_id=getattr(item, "counterpart_user_id", None),
+            ),
+        )
+
+    async def interpret_shadow_feedback(
+        self,
+        *,
+        case,
+        moderator_explanation: str,
+    ) -> ShadowFeedbackInterpretation:
+        """Parse one moderator free-text correction without learning yet."""
+
+        explanation = moderator_explanation.strip()
+        if not explanation:
+            raise ValueError("Feedback explanation cannot be empty.")
+
+        result = await self.deep_provider.generate_structured(
+            system_prompt=SHADOW_FEEDBACK_INTERPRET_SYSTEM_PROMPT,
+            user_prompt=build_shadow_feedback_interpret_prompt(
+                case=case,
+                moderator_explanation=explanation,
+            ),
+            response_model=ShadowFeedbackInterpretation,
+        )
+
+        # Repair simple schema-semantic inconsistencies defensively.
+        if result.corrected_action == "allow":
+            result = result.model_copy(
+                update={
+                    "current_message_violation": False,
+                    "category": "safe",
+                    "severity": "none",
+                }
+            )
+        elif result.corrected_action in {
+            "warn",
+            "delete",
+            "mute",
+            "ban",
+        }:
+            result = result.model_copy(
+                update={
+                    "current_message_violation": True,
+                }
+            )
+
+        if getattr(case, "counterpart_user_id", None) is None:
+            result = result.model_copy(
+                update={
+                    "apply_to_same_pair": False,
+                }
+            )
+
+        return result
+
     async def refine_gray_case(
         self,
         *,
@@ -205,7 +350,7 @@ class ModeratorFeedbackService:
                 baseline_policy,
             )
 
-        examples = (
+        ticket_records = (
             await self.repository
             .recent_moderator_feedback(
                 chat_id=(
@@ -216,6 +361,46 @@ class ModeratorFeedbackService:
                 limit=self.max_examples,
             )
         )
+
+        examples = [
+            self._ticket_example(item)
+            for item in ticket_records
+        ]
+
+        shadow_reader = getattr(
+            self.repository,
+            "recent_confirmed_shadow_feedback",
+            None,
+        )
+        if callable(shadow_reader):
+            try:
+                shadow_records = await shadow_reader(
+                    chat_id=context.current_message.chat_id,
+                    limit=max(self.max_examples * 2, 12),
+                )
+                examples.extend(
+                    self._shadow_example(
+                        item,
+                        context=context,
+                    )
+                    for item in shadow_records
+                )
+            except Exception:
+                logger.exception(
+                    "Shadow feedback read failed; ticket feedback remains available"
+                )
+
+        # Same-pair moderator feedback is especially useful for local banter /
+        # relationship context. It is still only soft guidance.
+        examples.sort(
+            key=lambda item: (
+                bool(item.same_pair),
+                item.created_at is not None,
+                str(item.created_at or ""),
+            ),
+            reverse=True,
+        )
+        examples = examples[: self.max_examples]
 
         raw_example_count = len(
             examples

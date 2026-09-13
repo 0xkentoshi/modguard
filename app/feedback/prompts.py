@@ -51,6 +51,15 @@ and recommend the appropriate action.
 Examples may be multilingual. Match meaning across language, slang,
 transliteration and paraphrase.
 
+RELATIONSHIP / SAME-PAIR FEEDBACK
+A feedback example may have same_user_pair=true and a moderator-provided
+relationship_note. That means a moderator previously said the relationship
+between these same participants mattered. Treat it as stronger chat-local soft
+context than raw reply counts, but still verify that the CURRENT exchange looks
+compatible with the stored rule. Never use friendship/familiarity to ignore a
+clear request to stop, one-sided abuse, a credible threat, or protected safety
+harm. Raw relationship_context is only weak familiarity evidence.
+
 EVIDENCE
 
 current_message_evidence may contain evidence ONLY from the CURRENT MESSAGE.
@@ -94,6 +103,11 @@ def build_feedback_review_prompt(
                 .normalized_text
             ),
         },
+        "relationship_context": (
+            context.relationship_signals.model_dump()
+            if context.relationship_signals.counterpart_user_id is not None
+            else None
+        ),
         "core_decision": {
             "category": (
                 baseline_decision.category
@@ -134,9 +148,106 @@ def build_feedback_review_prompt(
                 "policy_version": (
                     item.policy_version
                 ),
+                "source": getattr(
+                    item,
+                    "source",
+                    "ticket",
+                ),
+                "moderator_explanation": getattr(
+                    item,
+                    "moderator_note",
+                    "",
+                ),
+                "local_rule": getattr(
+                    item,
+                    "local_rule",
+                    "",
+                ),
+                "same_user_pair": bool(getattr(
+                    item,
+                    "same_pair",
+                    False,
+                )),
+                "relationship_note": getattr(
+                    item,
+                    "relationship_note",
+                    "",
+                ),
             }
             for item in examples
         ],
+    }
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+SHADOW_FEEDBACK_INTERPRET_SYSTEM_PROMPT = """
+You are ModGuard Shadow Feedback Interpreter.
+
+A real moderator disagreed with a Shadow-mode recommendation and explained the
+correction in free text. Your job is to translate that explanation into a safe,
+reusable, chat-local moderation precedent.
+
+IMPORTANT
+- Do not invent facts the moderator did not provide.
+- The correction is soft memory for THIS CHAT, not a global Core rule.
+- The correction must not become a blanket permission to ignore obvious scam,
+  phishing, malicious links, or credible physical threats.
+- Prefer rules phrased in terms of observable conversation context.
+- If the moderator relies on a personal relationship such as "these two are
+  friends", mark relationship_relevant=true.
+- apply_to_same_pair=true only when the case has a known reply counterpart AND
+  the moderator clearly says the relationship between these same users matters.
+- Raw reply-history familiarity is only a weak signal; it is not proof of
+  friendship or consent to abuse.
+- If the moderator asks to allow banter, the reusable rule should remain
+  conditional on reciprocal/playful context and must not ignore a clear request
+  to stop, one-sided degradation, threats, or protected safety harms.
+
+ACTION CONSISTENCY
+- corrected_action=allow => current_message_violation=false, category=safe,
+  severity=none.
+- warn/delete/mute/ban => current_message_violation=true.
+- Use escalate when the moderator explicitly says a human should decide or when
+  their explanation is too ambiguous to infer another action safely.
+
+unsupported_assumptions lists claims that cannot be observed from the supplied
+case/context and should not be generalized automatically.
+
+Write summary, local_rule, relationship_note, and unsupported_assumptions in
+concise English. Return only the required JSON. Do not output chain-of-thought.
+""".strip()
+
+
+def build_shadow_feedback_interpret_prompt(
+    *,
+    case,
+    moderator_explanation: str,
+) -> str:
+    try:
+        context_payload = json.loads(
+            getattr(case, "context_json", "{}") or "{}"
+        )
+    except Exception:
+        context_payload = {}
+
+    payload = {
+        "shadow_case": {
+            "message": getattr(case, "message_text", ""),
+            "ai_action": getattr(case, "ai_action", None),
+            "ai_category": getattr(case, "ai_category", None),
+            "ai_severity": getattr(case, "ai_severity", None),
+            "ai_confidence": getattr(case, "ai_confidence", None),
+            "ai_reason": getattr(case, "ai_reason", ""),
+            "target_user_id": getattr(case, "target_user_id", None),
+            "counterpart_user_id": getattr(case, "counterpart_user_id", None),
+        },
+        "available_context": context_payload,
+        "moderator_explanation": moderator_explanation,
     }
 
     return json.dumps(

@@ -26,6 +26,7 @@ from app.admin.control_models import (
     ModerationImmunityRecord,
     RaidIncidentRecord,
     SemanticObservationRecord,
+    ShadowFeedbackRecord,
     TestArtifactRecord,
 )
 from app.database.models import MessageRecord, ModerationEventRecord
@@ -211,6 +212,7 @@ class ControlRepository:
                     (CommunityPolicyDraftRecord, CommunityPolicyDraftRecord.chat_id),
                     (KnownModerationPatternRecord, KnownModerationPatternRecord.chat_id),
                     (ModeratorFeedbackRecord, ModeratorFeedbackRecord.chat_id),
+                    (ShadowFeedbackRecord, ShadowFeedbackRecord.chat_id),
                     (SemanticObservationRecord, SemanticObservationRecord.chat_id),
                     (RaidIncidentRecord, RaidIncidentRecord.chat_id),
                     (ModerationBanRecord, ModerationBanRecord.chat_id),
@@ -1438,6 +1440,362 @@ class ControlRepository:
                 result.scalar_one()
                 or 0
             )
+
+    async def create_shadow_feedback_case(
+        self,
+        *,
+        chat_id: int,
+        telegram_message_id: int | None,
+        target_user_id: int | None,
+        counterpart_user_id: int | None,
+        username: str | None,
+        message_text: str,
+        context: dict,
+        ai_action: str,
+        ai_category: str | None,
+        ai_severity: str | None,
+        ai_confidence: float | None,
+        ai_reason: str,
+        policy_version: int | None,
+    ) -> ShadowFeedbackRecord:
+        """Persist one real Shadow decision so moderators can teach from it."""
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                record = ShadowFeedbackRecord(
+                    chat_id=chat_id,
+                    telegram_message_id=telegram_message_id,
+                    target_user_id=target_user_id,
+                    counterpart_user_id=counterpart_user_id,
+                    username=username,
+                    message_text=message_text or "",
+                    context_json=json.dumps(
+                        context or {},
+                        ensure_ascii=False,
+                    ),
+                    ai_action=ai_action,
+                    ai_category=ai_category,
+                    ai_severity=ai_severity,
+                    ai_confidence=ai_confidence,
+                    ai_reason=ai_reason or "",
+                    policy_version=policy_version,
+                    status="pending",
+                )
+                session.add(record)
+                await session.flush()
+                return record
+
+    async def get_shadow_feedback_case(
+        self,
+        case_id: int,
+    ) -> ShadowFeedbackRecord | None:
+        async with self.session_factory() as session:
+            return await session.get(
+                ShadowFeedbackRecord,
+                int(case_id),
+            )
+
+    async def begin_shadow_feedback_disagreement(
+        self,
+        *,
+        case_id: int,
+        moderator_admin_id: int,
+        review_message_id: int | None,
+    ) -> ShadowFeedbackRecord | None:
+        """Claim a pending Shadow case and wait for free-text explanation."""
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                # An admin can teach one case at a time. Release any abandoned
+                # draft instead of silently learning from incomplete feedback.
+                previous_result = await session.execute(
+                    select(ShadowFeedbackRecord).where(
+                        ShadowFeedbackRecord.moderator_admin_id
+                        == moderator_admin_id,
+                        ShadowFeedbackRecord.status.in_(
+                            {
+                                "awaiting_explanation",
+                                "awaiting_confirmation",
+                            }
+                        ),
+                        ShadowFeedbackRecord.id != case_id,
+                    )
+                )
+                for previous in previous_result.scalars().all():
+                    previous.status = "pending"
+                    previous.moderator_admin_id = None
+                    previous.review_message_id = None
+                    previous.updated_at = utcnow()
+
+                case = await session.get(
+                    ShadowFeedbackRecord,
+                    int(case_id),
+                )
+                if case is None or case.status == "confirmed":
+                    return None
+                if (
+                    case.status in {
+                        "awaiting_explanation",
+                        "awaiting_confirmation",
+                    }
+                    and case.moderator_admin_id not in {
+                        None,
+                        moderator_admin_id,
+                    }
+                ):
+                    return None
+
+                case.status = "awaiting_explanation"
+                case.moderator_admin_id = moderator_admin_id
+                case.review_message_id = review_message_id
+                case.updated_at = utcnow()
+                await session.flush()
+                return case
+
+    async def pending_shadow_feedback_for_admin(
+        self,
+        *,
+        moderator_admin_id: int,
+    ) -> ShadowFeedbackRecord | None:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ShadowFeedbackRecord)
+                .where(
+                    ShadowFeedbackRecord.moderator_admin_id
+                    == moderator_admin_id,
+                    ShadowFeedbackRecord.status
+                    == "awaiting_explanation",
+                )
+                .order_by(
+                    ShadowFeedbackRecord.updated_at.desc(),
+                    ShadowFeedbackRecord.id.desc(),
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
+    async def save_shadow_feedback_interpretation(
+        self,
+        *,
+        case_id: int,
+        moderator_admin_id: int,
+        moderator_explanation: str,
+        corrected_action: str,
+        corrected_category: str,
+        corrected_severity: str,
+        local_rule: str,
+        relationship_note: str,
+        apply_to_same_pair: bool,
+        interpretation: dict,
+    ) -> ShadowFeedbackRecord | None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                case = await session.get(
+                    ShadowFeedbackRecord,
+                    int(case_id),
+                )
+                if (
+                    case is None
+                    or case.status != "awaiting_explanation"
+                    or case.moderator_admin_id != moderator_admin_id
+                ):
+                    return None
+
+                case.moderator_explanation = moderator_explanation.strip()
+                case.corrected_action = corrected_action
+                case.corrected_category = corrected_category
+                case.corrected_severity = corrected_severity
+                case.local_rule = local_rule.strip()
+                case.relationship_note = relationship_note.strip()
+                case.apply_to_same_pair = bool(
+                    apply_to_same_pair
+                    and case.counterpart_user_id is not None
+                    and case.target_user_id is not None
+                )
+                case.interpretation_json = json.dumps(
+                    interpretation,
+                    ensure_ascii=False,
+                )
+                case.status = "awaiting_confirmation"
+                case.updated_at = utcnow()
+                await session.flush()
+                return case
+
+    async def clarify_shadow_feedback(
+        self,
+        *,
+        case_id: int,
+        moderator_admin_id: int,
+    ) -> ShadowFeedbackRecord | None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                case = await session.get(
+                    ShadowFeedbackRecord,
+                    int(case_id),
+                )
+                if (
+                    case is None
+                    or case.status != "awaiting_confirmation"
+                    or case.moderator_admin_id != moderator_admin_id
+                ):
+                    return None
+                case.status = "awaiting_explanation"
+                case.updated_at = utcnow()
+                await session.flush()
+                return case
+
+    async def confirm_shadow_feedback(
+        self,
+        *,
+        case_id: int,
+        moderator_admin_id: int,
+    ) -> ShadowFeedbackRecord | None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                case = await session.get(
+                    ShadowFeedbackRecord,
+                    int(case_id),
+                )
+                if (
+                    case is None
+                    or case.status != "awaiting_confirmation"
+                    or case.moderator_admin_id != moderator_admin_id
+                    or not case.corrected_action
+                ):
+                    return None
+                case.status = "confirmed"
+                case.resolved_at = utcnow()
+                case.updated_at = utcnow()
+                await session.flush()
+                return case
+
+    async def agree_shadow_feedback(
+        self,
+        *,
+        case_id: int,
+        moderator_admin_id: int,
+    ) -> ShadowFeedbackRecord | None:
+        """A one-click agreement becomes a positive chat-scoped precedent."""
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                case = await session.get(
+                    ShadowFeedbackRecord,
+                    int(case_id),
+                )
+                if case is None or case.status != "pending":
+                    return None
+
+                case.moderator_admin_id = moderator_admin_id
+                case.corrected_action = case.ai_action
+                case.corrected_category = case.ai_category or "safe"
+                case.corrected_severity = case.ai_severity or "none"
+                case.local_rule = (
+                    "Moderator confirmed this Shadow decision for this community."
+                )
+                case.relationship_note = ""
+                case.apply_to_same_pair = False
+                case.interpretation_json = json.dumps(
+                    {
+                        "kind": "agreement",
+                        "corrected_action": case.ai_action,
+                    },
+                    ensure_ascii=False,
+                )
+                case.status = "confirmed"
+                case.resolved_at = utcnow()
+                case.updated_at = utcnow()
+                await session.flush()
+                return case
+
+    async def cancel_shadow_feedback(
+        self,
+        *,
+        case_id: int,
+        moderator_admin_id: int,
+    ) -> ShadowFeedbackRecord | None:
+        """Cancel a draft correction without learning anything from it."""
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                case = await session.get(
+                    ShadowFeedbackRecord,
+                    int(case_id),
+                )
+                if (
+                    case is None
+                    or case.status not in {
+                        "awaiting_explanation",
+                        "awaiting_confirmation",
+                    }
+                    or case.moderator_admin_id != moderator_admin_id
+                ):
+                    return None
+
+                case.status = "pending"
+                case.moderator_admin_id = None
+                case.review_message_id = None
+                case.moderator_explanation = ""
+                case.corrected_action = None
+                case.corrected_category = None
+                case.corrected_severity = None
+                case.local_rule = ""
+                case.relationship_note = ""
+                case.apply_to_same_pair = False
+                case.interpretation_json = "{}"
+                case.updated_at = utcnow()
+                await session.flush()
+                return case
+
+    async def recent_confirmed_shadow_feedback(
+        self,
+        *,
+        chat_id: int,
+        limit: int = 24,
+    ) -> list[ShadowFeedbackRecord]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ShadowFeedbackRecord)
+                .where(
+                    ShadowFeedbackRecord.chat_id == chat_id,
+                    ShadowFeedbackRecord.status == "confirmed",
+                )
+                .order_by(
+                    ShadowFeedbackRecord.resolved_at.desc(),
+                    ShadowFeedbackRecord.id.desc(),
+                )
+                .limit(max(1, min(int(limit), 80)))
+            )
+            return list(result.scalars().all())
+
+    async def shadow_feedback_stats(
+        self,
+        *,
+        chat_id: int,
+    ) -> dict[str, int]:
+        """Small calibration metric set for dashboard/debugging and future UI."""
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ShadowFeedbackRecord).where(
+                    ShadowFeedbackRecord.chat_id == chat_id,
+                    ShadowFeedbackRecord.status == "confirmed",
+                )
+            )
+            rows = list(result.scalars().all())
+
+        agreed = sum(
+            1
+            for item in rows
+            if item.corrected_action == item.ai_action
+            and not item.moderator_explanation.strip()
+        )
+        corrected = len(rows) - agreed
+        return {
+            "confirmed": len(rows),
+            "agreed": agreed,
+            "corrected": corrected,
+        }
 
     async def get_activity_summary(
         self, *, chat_id: int, hours: int = 24

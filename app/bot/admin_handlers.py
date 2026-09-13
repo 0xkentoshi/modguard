@@ -1,3 +1,4 @@
+import html
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -5,7 +6,13 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, ChatPermissions, Message
+from aiogram.types import (
+    CallbackQuery,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app.admin.control_repository import ControlRepository
 from app.admin.dashboard import DashboardService
@@ -103,6 +110,171 @@ async def can_access_chat(
             chat_id,
         )
         return False
+
+
+def shadow_feedback_case_text(
+    case,
+    *,
+    stage: str = "pending",
+    interpretation_summary: str | None = None,
+    unsupported_assumptions: list[str] | None = None,
+) -> str:
+    who = (
+        getattr(case, "username", None)
+        or (
+            f"user {case.target_user_id}"
+            if getattr(case, "target_user_id", None) is not None
+            else "unknown"
+        )
+    )
+    confidence = (
+        f"{case.ai_confidence:.0%}"
+        if getattr(case, "ai_confidence", None) is not None
+        else "—"
+    )
+    message_text = (getattr(case, "message_text", "") or "").strip()
+    if len(message_text) > 320:
+        message_text = message_text[:320] + "..."
+
+    base = (
+        f"🛡 <b>SHADOW FEEDBACK</b>\n"
+        f"{html.escape(str(who))} · "
+        f"{html.escape(str(getattr(case, 'ai_category', None) or 'other'))} · "
+        f"{confidence}\n\n"
+        f"<code>{html.escape(message_text or '[non-text message]')}</code>\n\n"
+        f"<b>ModGuard:</b> {html.escape(str(getattr(case, 'ai_action', 'escalate')).upper())}\n"
+        f"<b>Why:</b> {html.escape((getattr(case, 'ai_reason', '') or '')[:500])}"
+    )
+
+    if stage == "explain":
+        return (
+            base
+            + "\n\n❌ <b>You disagree.</b>\n"
+            + "Explain in one normal message <b>why this decision is wrong</b> "
+              "and <b>what ModGuard should do instead</b>.\n\n"
+            + "You can include context such as local chat culture, recurring jokes, "
+              "or a known relationship between these participants. ModGuard will "
+              "first show how it understood you; nothing is learned until you confirm it."
+        )
+
+    if stage == "clarify":
+        previous = (getattr(case, "moderator_explanation", "") or "").strip()
+        previous_block = ""
+        if previous:
+            previous_block = (
+                "\n\n<b>Previous explanation:</b>\n"
+                f"{html.escape(previous[:700])}"
+            )
+        return (
+            base
+            + previous_block
+            + "\n\n✏️ <b>Send one more message with the correction/clarification.</b>\n"
+              "I will reinterpret the combined feedback and show it again before saving."
+        )
+
+    if stage == "confirm":
+        corrected = html.escape(
+            str(getattr(case, "corrected_action", None) or "escalate").upper()
+        )
+        local_rule = html.escape(
+            (getattr(case, "local_rule", "") or "")[:800]
+        )
+        relation = (getattr(case, "relationship_note", "") or "").strip()
+        relation_block = ""
+        if relation:
+            pair_scope = (
+                "same participant pair"
+                if getattr(case, "apply_to_same_pair", False)
+                else "community context only"
+            )
+            relation_block = (
+                "\n\n<b>Relationship context:</b> "
+                f"{html.escape(relation[:500])}\n"
+                f"<b>Scope:</b> {html.escape(pair_scope)}"
+            )
+        unsupported_block = ""
+        if unsupported_assumptions:
+            unsupported_block = (
+                "\n\n<b>Cannot verify automatically:</b>\n"
+                + "\n".join(
+                    f"• {html.escape(item[:240])}"
+                    for item in unsupported_assumptions[:5]
+                )
+            )
+        summary_block = ""
+        if interpretation_summary:
+            summary_block = (
+                "\n\n<b>I understood:</b> "
+                + html.escape(interpretation_summary[:600])
+            )
+        return (
+            base
+            + "\n\n🧠 <b>Proposed correction</b>\n"
+            + f"Correct action: <b>{corrected}</b>\n"
+            + f"Local rule: {local_rule}"
+            + summary_block
+            + relation_block
+            + unsupported_block
+            + "\n\nThis memory stays inside this community and remains soft guidance; "
+              "Core safety still runs first."
+        )
+
+    if stage == "saved":
+        action = html.escape(
+            str(getattr(case, "moderator_action", "allow")).upper()
+        )
+        return (
+            base
+            + f"\n\n✅ <b>Feedback saved.</b> Correct action: <b>{action}</b>.\n"
+              "It can now help with similar gray cases in this community."
+        )
+
+    return base
+
+
+def shadow_feedback_keyboard(
+    case_id: int,
+    *,
+    stage: str,
+) -> InlineKeyboardMarkup:
+    if stage == "pending":
+        rows = [[
+            InlineKeyboardButton(
+                text="✅ Agree",
+                callback_data=f"mg:sagree:{case_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Disagree",
+                callback_data=f"mg:sdisagree:{case_id}",
+            ),
+        ]]
+    elif stage == "confirm":
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="✅ Save",
+                    callback_data=f"mg:sfsave:{case_id}",
+                ),
+                InlineKeyboardButton(
+                    text="✏️ Clarify",
+                    callback_data=f"mg:sfclarify:{case_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Cancel",
+                    callback_data=f"mg:sfcancel:{case_id}",
+                )
+            ],
+        ]
+    else:
+        rows = [[
+            InlineKeyboardButton(
+                text="Cancel",
+                callback_data=f"mg:sfcancel:{case_id}",
+            )
+        ]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def remove_stale_dashboard_copy(
@@ -314,10 +486,21 @@ async def admin_callback(
     # basic-group -> supergroup aliases left by older ModGuard versions.
     await dashboard_service.reconcile_managed_chats()
 
-    stale = await remove_stale_dashboard_copy(
-        callback=callback,
-        repository=control_repository,
-    )
+    if action in {
+        "sagree",
+        "sdisagree",
+        "sfsave",
+        "sfclarify",
+        "sfcancel",
+    }:
+        # Shadow feedback lives in separate alert messages, not in the pinned
+        # dashboard. Never treat these messages as stale dashboard copies.
+        stale = False
+    else:
+        stale = await remove_stale_dashboard_copy(
+            callback=callback,
+            repository=control_repository,
+        )
 
     toast = (
         "Stale dashboard removed"
@@ -326,6 +509,204 @@ async def admin_callback(
     )
 
     try:
+        if action in {
+            "sagree",
+            "sdisagree",
+            "sfsave",
+            "sfclarify",
+            "sfcancel",
+        }:
+            if len(parts) < 3:
+                await safe_callback_answer(
+                    callback,
+                    "Feedback case is missing.",
+                    show_alert=True,
+                )
+                return
+
+            case_id = int(parts[2])
+            case = await control_repository.get_shadow_feedback_case(
+                case_id
+            )
+            if case is None:
+                await safe_callback_answer(
+                    callback,
+                    "Shadow feedback case not found.",
+                    show_alert=True,
+                )
+                return
+
+            if not await can_access_chat(
+                admin_id,
+                case.chat_id,
+                pilot_access_service,
+            ):
+                await safe_callback_answer(
+                    callback,
+                    "Not authorized for this community.",
+                    show_alert=True,
+                )
+                return
+
+            async def edit_feedback_alert(
+                record,
+                *,
+                stage: str,
+                keyboard_stage: str | None = None,
+            ) -> None:
+                text = shadow_feedback_case_text(
+                    record,
+                    stage=stage,
+                )
+                keyboard = (
+                    shadow_feedback_keyboard(
+                        record.id,
+                        stage=keyboard_stage,
+                    )
+                    if keyboard_stage is not None
+                    else None
+                )
+                if callback.message is not None:
+                    try:
+                        await callback.message.edit_text(
+                            text=text,
+                            parse_mode="HTML",
+                            reply_markup=keyboard,
+                        )
+                        return
+                    except Exception:
+                        logger.debug(
+                            "Could not edit Shadow feedback alert.",
+                            exc_info=True,
+                        )
+                await dashboard_service.bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+
+            if action == "sagree":
+                saved = await control_repository.agree_shadow_feedback(
+                    case_id=case_id,
+                    moderator_admin_id=admin_id,
+                )
+                if saved is None:
+                    await safe_callback_answer(
+                        callback,
+                        "This case is already being reviewed or was resolved.",
+                        show_alert=True,
+                    )
+                    return
+                await edit_feedback_alert(
+                    saved,
+                    stage="saved",
+                )
+                await safe_callback_answer(
+                    callback,
+                    "Feedback saved",
+                )
+                return
+
+            if action == "sdisagree":
+                review_message_id = (
+                    callback.message.message_id
+                    if callback.message is not None
+                    else None
+                )
+                claimed = (
+                    await control_repository.begin_shadow_feedback_disagreement(
+                        case_id=case_id,
+                        moderator_admin_id=admin_id,
+                        review_message_id=review_message_id,
+                    )
+                )
+                if claimed is None:
+                    await safe_callback_answer(
+                        callback,
+                        "This case was already resolved.",
+                        show_alert=True,
+                    )
+                    return
+                await edit_feedback_alert(
+                    claimed,
+                    stage="explain",
+                    keyboard_stage="input",
+                )
+                await safe_callback_answer(
+                    callback,
+                    "Send your explanation as a normal message",
+                )
+                return
+
+            if action == "sfsave":
+                saved = await control_repository.confirm_shadow_feedback(
+                    case_id=case_id,
+                    moderator_admin_id=admin_id,
+                )
+                if saved is None:
+                    await safe_callback_answer(
+                        callback,
+                        "No correction is waiting for confirmation.",
+                        show_alert=True,
+                    )
+                    return
+                await edit_feedback_alert(
+                    saved,
+                    stage="saved",
+                )
+                await safe_callback_answer(
+                    callback,
+                    "Correction learned for this community",
+                )
+                return
+
+            if action == "sfclarify":
+                pending = await control_repository.clarify_shadow_feedback(
+                    case_id=case_id,
+                    moderator_admin_id=admin_id,
+                )
+                if pending is None:
+                    await safe_callback_answer(
+                        callback,
+                        "This correction is no longer editable.",
+                        show_alert=True,
+                    )
+                    return
+                await edit_feedback_alert(
+                    pending,
+                    stage="clarify",
+                    keyboard_stage="input",
+                )
+                await safe_callback_answer(
+                    callback,
+                    "Send the clarification as a normal message",
+                )
+                return
+
+            if action == "sfcancel":
+                cancelled = await control_repository.cancel_shadow_feedback(
+                    case_id=case_id,
+                    moderator_admin_id=admin_id,
+                )
+                if cancelled is None:
+                    await safe_callback_answer(
+                        callback,
+                        "Nothing to cancel.",
+                        show_alert=True,
+                    )
+                    return
+                await edit_feedback_alert(
+                    cancelled,
+                    stage="pending",
+                    keyboard_stage="pending",
+                )
+                await safe_callback_answer(
+                    callback,
+                    "Feedback draft cancelled",
+                )
+                return
+
         if action == "test":
             chat_id = int(parts[2])
 
@@ -1590,6 +1971,7 @@ async def community_policy_text_input(
     dashboard_service: DashboardService,
     control_repository: ControlRepository,
     community_policy_service: CommunityPolicyService,
+    feedback_service: ModeratorFeedbackService,
     app_settings: Settings,
     pilot_access_service=None,
 ) -> None:
@@ -1621,6 +2003,162 @@ async def community_policy_text_input(
         return
 
     admin_id = message.from_user.id
+
+    # Shadow feedback input is independent from the pinned dashboard. An
+    # authorized moderator can teach ModGuard directly from a Shadow alert even
+    # if the dashboard was not opened in this private chat.
+    pending_shadow = (
+        await control_repository.pending_shadow_feedback_for_admin(
+            moderator_admin_id=admin_id
+        )
+    )
+    if pending_shadow is not None:
+        if not await can_access_chat(
+            admin_id,
+            pending_shadow.chat_id,
+            pilot_access_service,
+        ):
+            await control_repository.cancel_shadow_feedback(
+                case_id=pending_shadow.id,
+                moderator_admin_id=admin_id,
+            )
+            return
+
+        new_text = (message.text or "").strip()
+        previous_text = (
+            pending_shadow.moderator_explanation or ""
+        ).strip()
+        combined_text = (
+            new_text
+            if not previous_text
+            else previous_text + "\nClarification: " + new_text
+        )
+
+        try:
+            interpretation = (
+                await feedback_service.interpret_shadow_feedback(
+                    case=pending_shadow,
+                    moderator_explanation=combined_text,
+                )
+            )
+
+            saved_case = (
+                await control_repository.save_shadow_feedback_interpretation(
+                    case_id=pending_shadow.id,
+                    moderator_admin_id=admin_id,
+                    moderator_explanation=combined_text,
+                    corrected_action=interpretation.corrected_action,
+                    corrected_category=interpretation.category,
+                    corrected_severity=interpretation.severity,
+                    local_rule=interpretation.local_rule,
+                    relationship_note=(
+                        interpretation.relationship_note
+                        if interpretation.relationship_relevant
+                        else ""
+                    ),
+                    apply_to_same_pair=(
+                        interpretation.relationship_relevant
+                        and interpretation.apply_to_same_pair
+                    ),
+                    interpretation=interpretation.model_dump(),
+                )
+            )
+
+            if saved_case is None:
+                raise RuntimeError(
+                    "Shadow feedback draft expired before it could be saved."
+                )
+
+            preview_text = shadow_feedback_case_text(
+                saved_case,
+                stage="confirm",
+                interpretation_summary=interpretation.summary,
+                unsupported_assumptions=(
+                    interpretation.unsupported_assumptions
+                ),
+            )
+            preview_keyboard = shadow_feedback_keyboard(
+                saved_case.id,
+                stage="confirm",
+            )
+
+            edited = False
+            if saved_case.review_message_id is not None:
+                try:
+                    await dashboard_service.bot.edit_message_text(
+                        chat_id=admin_id,
+                        message_id=saved_case.review_message_id,
+                        text=preview_text,
+                        parse_mode="HTML",
+                        reply_markup=preview_keyboard,
+                    )
+                    edited = True
+                except Exception:
+                    logger.debug(
+                        "Could not edit Shadow feedback review message.",
+                        exc_info=True,
+                    )
+
+            if not edited:
+                await dashboard_service.bot.send_message(
+                    chat_id=admin_id,
+                    text=preview_text,
+                    parse_mode="HTML",
+                    reply_markup=preview_keyboard,
+                )
+
+        except Exception as exc:
+            logger.exception(
+                "Shadow feedback interpretation failed | case=%s",
+                pending_shadow.id,
+            )
+            error_text = (
+                shadow_feedback_case_text(
+                    pending_shadow,
+                    stage="explain",
+                )
+                + "\n\n⚠️ <b>I could not interpret that feedback.</b> "
+                  "Please try again with a little more detail.\n"
+                + html.escape(str(exc)[:220])
+            )
+            try:
+                if pending_shadow.review_message_id is not None:
+                    await dashboard_service.bot.edit_message_text(
+                        chat_id=admin_id,
+                        message_id=pending_shadow.review_message_id,
+                        text=error_text,
+                        parse_mode="HTML",
+                        reply_markup=shadow_feedback_keyboard(
+                            pending_shadow.id,
+                            stage="input",
+                        ),
+                    )
+                else:
+                    await dashboard_service.bot.send_message(
+                        chat_id=admin_id,
+                        text=error_text,
+                        parse_mode="HTML",
+                        reply_markup=shadow_feedback_keyboard(
+                            pending_shadow.id,
+                            stage="input",
+                        ),
+                    )
+            except Exception:
+                logger.debug(
+                    "Could not render Shadow feedback error.",
+                    exc_info=True,
+                )
+
+        finally:
+            try:
+                await message.delete()
+            except Exception:
+                logger.debug(
+                    "Could not delete Shadow feedback input message.",
+                    exc_info=True,
+                )
+        return
+
     state = await control_repository.get_dashboard_state(
         admin_id
     )

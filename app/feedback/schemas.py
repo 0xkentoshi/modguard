@@ -41,3 +41,34 @@ class FeedbackReviewDecision(BaseModel):
         default_factory=list,
         max_length=5,
     )
+
+
+class ShadowFeedbackInterpretation(BaseModel):
+    """Structured interpretation of a moderator's free-text Shadow correction."""
+
+    corrected_action: ModerationAction
+    category: ModerationCategory
+    severity: ModerationSeverity
+    current_message_violation: bool
+
+    summary: str = Field(
+        min_length=1,
+        max_length=600,
+    )
+
+    local_rule: str = Field(
+        min_length=1,
+        max_length=800,
+    )
+
+    relationship_relevant: bool = False
+    relationship_note: str = Field(
+        default="",
+        max_length=500,
+    )
+    apply_to_same_pair: bool = False
+
+    unsupported_assumptions: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+    )
