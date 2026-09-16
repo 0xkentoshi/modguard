@@ -1,4 +1,5 @@
 import html
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -83,6 +84,9 @@ async def allowed(
     settings: Settings,
     pilot_access_service=None,
 ) -> bool:
+    # Static public ADMIN_IDS always retain access. An optional external
+    # access provider can grant additional scoped access, but must never
+    # revoke the repository owner's/admin's explicit ADMIN_IDS access.
     if user_id in settings.admin_id_list:
         return True
     if pilot_access_service is None:
@@ -112,12 +116,126 @@ async def can_access_chat(
         return False
 
 
+async def delete_transient_admin_card(
+    *,
+    callback: CallbackQuery,
+    repository: ControlRepository,
+    admin_id: int,
+) -> bool:
+    """Delete a ticket/review card without ever deleting the persistent dashboard."""
+    if callback.message is None:
+        return False
+
+    try:
+        state = await repository.get_dashboard_state(int(admin_id))
+    except Exception:
+        logger.debug("Could not resolve dashboard state before card cleanup.", exc_info=True)
+        state = None
+
+    if (
+        state is not None
+        and state.dashboard_message_id is not None
+        and int(state.dashboard_message_id) == int(callback.message.message_id)
+    ):
+        logger.warning(
+            "TRANSIENT CARD DELETE SKIPPED | reason=persistent_dashboard | admin=%s | message=%s",
+            admin_id,
+            callback.message.message_id,
+        )
+        return False
+
+    try:
+        await callback.message.delete()
+        return True
+    except Exception:
+        logger.debug("Could not delete transient admin card.", exc_info=True)
+        return False
+
+
+async def sync_shadow_feedback_mirrors(
+    *,
+    dashboard_service: DashboardService,
+    repository: ControlRepository,
+    record,
+    save_note: str,
+    save_outcome: str,
+) -> None:
+    """Best-effort update of every DM mirror for one resolved Shadow case."""
+    reader = getattr(repository, "list_admin_alert_artifacts", None)
+    if not callable(reader):
+        return
+    try:
+        artifacts = await reader(
+            managed_chat_id=int(record.chat_id),
+            kind=f"shadow_alert:{int(record.id)}",
+        )
+        try:
+            community_title = await dashboard_service._chat_title(int(record.chat_id))
+        except Exception:
+            community_title = None
+        text = shadow_feedback_case_text(
+            record,
+            stage="saved",
+            save_note=save_note,
+            save_outcome=save_outcome,
+            community_title_override=community_title,
+        )
+        resolver = getattr(record, "moderator_admin_id", None)
+        if resolver is not None:
+            text += f"\n\nHandled by moderator <code>{int(resolver)}</code>."
+        keyboard = shadow_feedback_keyboard(
+            int(record.id),
+            stage="saved",
+            chat_id=int(record.chat_id),
+        )
+        for artifact in artifacts:
+            try:
+                await dashboard_service.bot.edit_message_text(
+                    chat_id=int(artifact.admin_chat_id),
+                    message_id=int(artifact.telegram_message_id),
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                logger.debug(
+                    "Could not sync resolved Shadow mirror | case=%s | artifact=%s",
+                    record.id,
+                    getattr(artifact, "id", None),
+                    exc_info=True,
+                )
+    except Exception:
+        logger.debug(
+            "Could not enumerate resolved Shadow mirrors | case=%s",
+            getattr(record, "id", None),
+            exc_info=True,
+        )
+
+
+def moderation_action_label(action: str | None) -> str:
+    value = str(action or "escalate").strip().casefold()
+    if value == "mute":
+        return "MUTE + DELETE"
+    if value == "ban":
+        return "BAN + DELETE"
+    if value == "delete":
+        return "DELETE"
+    if value == "warn":
+        return "WARN"
+    if value == "allow":
+        return "ALLOW"
+    return value.upper()
+
+
 def shadow_feedback_case_text(
     case,
     *,
     stage: str = "pending",
     interpretation_summary: str | None = None,
     unsupported_assumptions: list[str] | None = None,
+    save_note: str | None = None,
+    save_outcome: str | None = None,
+    community_title_override: str | None = None,
 ) -> str:
     who = (
         getattr(case, "username", None)
@@ -136,14 +254,47 @@ def shadow_feedback_case_text(
     if len(message_text) > 320:
         message_text = message_text[:320] + "..."
 
+    try:
+        case_context = json.loads(
+            getattr(case, "context_json", "{}") or "{}"
+        )
+    except Exception:
+        case_context = {}
+
+    core_action = str(
+        case_context.get("core_recommendation")
+        or moderation_action_label(getattr(case, "ai_action", "escalate"))
+    ).upper()
+    policy_action = str(
+        case_context.get("community_policy_result")
+        or moderation_action_label(getattr(case, "ai_action", "escalate"))
+    ).upper()
+    effective_action = str(
+        case_context.get("effective_shadow_action")
+        or policy_action
+    ).upper()
+
+    community_title = str(
+        community_title_override
+        or case_context.get("chat_title")
+        or f"chat {getattr(case, 'chat_id', 'unknown')}"
+    )
+
     base = (
         f"🛡 <b>SHADOW FEEDBACK</b>\n"
+        f"🏘 <b>Community:</b> {html.escape(community_title)}\n"
         f"{html.escape(str(who))} · "
         f"{html.escape(str(getattr(case, 'ai_category', None) or 'other'))} · "
         f"{confidence}\n\n"
         f"<code>{html.escape(message_text or '[non-text message]')}</code>\n\n"
-        f"<b>ModGuard:</b> {html.escape(str(getattr(case, 'ai_action', 'escalate')).upper())}\n"
-        f"<b>Why:</b> {html.escape((getattr(case, 'ai_reason', '') or '')[:500])}"
+        f"<b>AI/Core recommendation:</b> {html.escape(core_action)}\n"
+        + (
+            f"<b>Community policy result:</b> {html.escape(policy_action)}\n"
+            if case_context.get("policy_source") == "community_policy"
+            else ""
+        )
+        + f"<b>With current safety settings:</b> {html.escape(effective_action)}\n"
+        + f"<b>Why:</b> {html.escape((getattr(case, 'ai_reason', '') or '')[:500])}"
     )
 
     if stage == "explain":
@@ -152,9 +303,15 @@ def shadow_feedback_case_text(
             + "\n\n❌ <b>You disagree.</b>\n"
             + "Explain in one normal message <b>why this decision is wrong</b> "
               "and <b>what ModGuard should do instead</b>.\n\n"
-            + "You can include context such as local chat culture, recurring jokes, "
-              "or a known relationship between these participants. ModGuard will "
-              "first show how it understood you; nothing is learned until you confirm it."
+            + "<b>Best feedback format</b>\n"
+              "1. What ModGuard misunderstood\n"
+              "2. When this rule should apply\n"
+              "3. Correct action\n\n"
+              "<i>Example: Friendly insults are allowed while both users are clearly "
+              "joking. If one asks to stop and the other continues, treat it as "
+              "harassment. Correct action: WARN.</i>\n\n"
+            + "Natural language and slang are fine. ModGuard will first show how it "
+              "understood you; nothing is learned until you confirm it."
         )
 
     if stage == "clarify":
@@ -174,7 +331,7 @@ def shadow_feedback_case_text(
 
     if stage == "confirm":
         corrected = html.escape(
-            str(getattr(case, "corrected_action", None) or "escalate").upper()
+            moderation_action_label(getattr(case, "corrected_action", None))
         )
         local_rule = html.escape(
             (getattr(case, "local_rule", "") or "")[:800]
@@ -221,12 +378,48 @@ def shadow_feedback_case_text(
 
     if stage == "saved":
         action = html.escape(
-            str(getattr(case, "moderator_action", "allow")).upper()
+            moderation_action_label(getattr(case, "moderator_action", "allow"))
         )
+        note = (
+            save_note
+            or "Saved as chat-local feedback for future gray cases."
+        )
+
+        # A rejected correction must never be presented as the "correct"
+        # action. In particular, Protected Core may accept the feedback for
+        # audit while refusing to promote phishing/scam -> ALLOW into policy.
+        if save_outcome == "protected_audit_only":
+            return (
+                base
+                + f"\n\n✅ <b>Feedback received.</b> "
+                  f"Requested correction: <b>{action}</b>.\n"
+                + "🛡 <b>Protected Core blocked this policy change.</b>\n"
+                + html.escape(note)
+            )
+
+        if save_outcome == "safety_review_failed":
+            return (
+                base
+                + f"\n\n✅ <b>Feedback received.</b> "
+                  f"Requested correction: <b>{action}</b>.\n"
+                + "🛡 <b>Policy was left unchanged because the safety "
+                  "re-check did not complete safely.</b>\n"
+                + html.escape(note)
+            )
+
+        if save_outcome == "confirmed":
+            return (
+                base
+                + f"\n\n✅ <b>Feedback saved.</b> "
+                  f"AI decision confirmed: <b>{action}</b>.\n"
+                + html.escape(note)
+            )
+
         return (
             base
-            + f"\n\n✅ <b>Feedback saved.</b> Correct action: <b>{action}</b>.\n"
-              "It can now help with similar gray cases in this community."
+            + f"\n\n✅ <b>Feedback saved.</b> "
+              f"Corrected action: <b>{action}</b>.\n"
+            + html.escape(note)
         )
 
     return base
@@ -236,15 +429,16 @@ def shadow_feedback_keyboard(
     case_id: int,
     *,
     stage: str,
+    chat_id: int | None = None,
 ) -> InlineKeyboardMarkup:
     if stage == "pending":
         rows = [[
             InlineKeyboardButton(
-                text="✅ Agree",
+                text="✅ AI decision correct",
                 callback_data=f"mg:sagree:{case_id}",
             ),
             InlineKeyboardButton(
-                text="❌ Disagree",
+                text="❌ AI decision wrong",
                 callback_data=f"mg:sdisagree:{case_id}",
             ),
         ]]
@@ -267,13 +461,23 @@ def shadow_feedback_keyboard(
                 )
             ],
         ]
-    else:
+    elif stage in {"input", "clarify"}:
         rows = [[
             InlineKeyboardButton(
                 text="Cancel",
                 callback_data=f"mg:sfcancel:{case_id}",
             )
         ]]
+    else:
+        rows = []
+
+    if chat_id is not None:
+        rows.append([
+            InlineKeyboardButton(
+                text="🧹 Clear this community alerts",
+                callback_data=f"mg:shadow_clear:{chat_id}",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -361,6 +565,12 @@ async def start_private(
         )
         return
 
+    if (
+        pilot_access_service is not None
+        and await pilot_access_service.is_superadmin(message.from_user.id)
+    ):
+        await pilot_access_service.close_ops_message(message.from_user.id)
+
     await dashboard_service.open_dashboard(
         admin_id=message.from_user.id
     )
@@ -387,7 +597,13 @@ async def dashboard_command(
         return
 
     # Intentionally updates the ONE tracked dashboard instead of creating
-    # another message. This is the anti-spam behavior.
+    # another message. Platform owners also use one panel at a time: opening
+    # Dashboard removes OPS first.
+    if (
+        pilot_access_service is not None
+        and await pilot_access_service.is_superadmin(message.from_user.id)
+    ):
+        await pilot_access_service.close_ops_message(message.from_user.id)
     await dashboard_service.open_dashboard(
         admin_id=message.from_user.id
     )
@@ -403,7 +619,7 @@ async def dashboard_command(
 
 
 @router.message(
-    Command("myid"),
+    Command("myid", "id"),
     PRIVATE_CHAT,
 )
 async def show_my_id(
@@ -482,19 +698,18 @@ async def admin_callback(
             )
             return
 
-    # First admin interaction after restart also repairs any Telegram
-    # basic-group -> supergroup aliases left by older ModGuard versions.
-    await dashboard_service.reconcile_managed_chats()
-
     if action in {
         "sagree",
         "sdisagree",
         "sfsave",
         "sfclarify",
         "sfcancel",
+        "ticket",
+        "tact",
+        "tclose",
     }:
-        # Shadow feedback lives in separate alert messages, not in the pinned
-        # dashboard. Never treat these messages as stale dashboard copies.
+        # Shadow feedback and review cards live in separate transient messages,
+        # not in the persistent dashboard. Never treat them as stale copies.
         stale = False
     else:
         stale = await remove_stale_dashboard_copy(
@@ -507,6 +722,10 @@ async def admin_callback(
         if stale
         else None
     )
+
+    claimed_ticket_id: int | None = None
+    claimed_ticket_action: str | None = None
+    claimed_action_committed = False
 
     try:
         if action in {
@@ -553,18 +772,30 @@ async def admin_callback(
                 *,
                 stage: str,
                 keyboard_stage: str | None = None,
+                save_note: str | None = None,
+                save_outcome: str | None = None,
             ) -> None:
+                try:
+                    resolved_community_title = await dashboard_service._chat_title(
+                        int(record.chat_id)
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not resolve Shadow feedback community title.",
+                        exc_info=True,
+                    )
+                    resolved_community_title = None
                 text = shadow_feedback_case_text(
                     record,
                     stage=stage,
+                    save_note=save_note,
+                    save_outcome=save_outcome,
+                    community_title_override=resolved_community_title,
                 )
-                keyboard = (
-                    shadow_feedback_keyboard(
-                        record.id,
-                        stage=keyboard_stage,
-                    )
-                    if keyboard_stage is not None
-                    else None
+                keyboard = shadow_feedback_keyboard(
+                    record.id,
+                    stage=(keyboard_stage or "saved"),
+                    chat_id=record.chat_id,
                 )
                 if callback.message is not None:
                     try:
@@ -598,9 +829,22 @@ async def admin_callback(
                         show_alert=True,
                     )
                     return
+                agree_note = (
+                    "AI recommendation confirmed. Stored as positive "
+                    "chat-local calibration; Community Policy was not changed."
+                )
                 await edit_feedback_alert(
                     saved,
                     stage="saved",
+                    save_note=agree_note,
+                    save_outcome="confirmed",
+                )
+                await sync_shadow_feedback_mirrors(
+                    dashboard_service=dashboard_service,
+                    repository=control_repository,
+                    record=saved,
+                    save_note=agree_note,
+                    save_outcome="confirmed",
                 )
                 await safe_callback_answer(
                     callback,
@@ -651,13 +895,94 @@ async def admin_callback(
                         show_alert=True,
                     )
                     return
+                policy_version, promotion = (
+                    await community_policy_service.promote_shadow_feedback(
+                        case=saved,
+                        admin_id=admin_id,
+                    )
+                )
+
+                if promotion == "policy" and policy_version is not None:
+                    save_note = (
+                        f"Added to Community Policy v{policy_version.version}. "
+                        "You can inspect or remove the learned rule from Rules."
+                    )
+                elif promotion == "policy_replaced" and policy_version is not None:
+                    save_note = (
+                        f"Community Policy v{policy_version.version} updated. "
+                        "This correction replaced older learned rule(s) for the "
+                        "same moderation topic instead of creating a conflict."
+                    )
+                elif promotion == "protected_audit_only":
+                    save_note = (
+                        "Saved for audit only. An independent Protected Core "
+                        "re-check found scam/phishing/malicious-link/threat safety "
+                        "that this correction would weaken below its safe floor. "
+                        "Community Policy was not changed."
+                    )
+                elif promotion == "safety_review_failed":
+                    save_note = (
+                        "Saved for audit only. The independent Protected Core "
+                        "re-check could not complete safely, so policy learning "
+                        "was skipped rather than weakening protection."
+                    )
+                elif promotion == "manual_conflict":
+                    save_note = (
+                        "Saved as feedback, but Community Policy was not changed "
+                        "because a manual administrator rule already owns this "
+                        "policy topic. Edit that manual rule explicitly if needed."
+                    )
+                elif promotion == "reconcile_uncertain":
+                    save_note = (
+                        "Saved as feedback, but no learned rule was created because "
+                        "ModGuard could not safely determine whether this was a new "
+                        "policy topic or a revision of an existing one."
+                    )
+                elif promotion == "pair_memory":
+                    save_note = (
+                        "Saved as pair-scoped relationship feedback. It was not "
+                        "promoted into chat-wide Community Policy."
+                    )
+                elif promotion == "policy_full":
+                    save_note = (
+                        "Saved as soft feedback. Community Policy already has 20 "
+                        "manual rules, so no rule was auto-added."
+                    )
+                else:
+                    save_note = (
+                        "Saved as chat-local feedback; no Community Policy rule "
+                        "was created for this correction."
+                    )
+
                 await edit_feedback_alert(
                     saved,
                     stage="saved",
+                    save_note=save_note,
+                    save_outcome=promotion,
+                )
+                await sync_shadow_feedback_mirrors(
+                    dashboard_service=dashboard_service,
+                    repository=control_repository,
+                    record=saved,
+                    save_note=save_note,
+                    save_outcome=promotion,
                 )
                 await safe_callback_answer(
                     callback,
-                    "Correction learned for this community",
+                    (
+                        f"Policy v{policy_version.version} updated"
+                        if promotion in {"policy", "policy_replaced"}
+                        and policy_version is not None
+                        else (
+                            "Protected Core blocked policy change"
+                            if promotion == "protected_audit_only"
+                            else (
+                                "Safety review failed; policy unchanged"
+                                if promotion == "safety_review_failed"
+                                else "Correction saved"
+                            )
+                        )
+                    ),
                 )
                 return
 
@@ -730,10 +1055,15 @@ async def admin_callback(
 
         elif action == "test_shadow":
             chat_id = int(parts[2])
-
-            enabled = await control_repository.toggle_shadow(
-                chat_id
-            )
+            current_settings = await control_repository.get_chat_settings(chat_id)
+            target_shadow = not bool(current_settings.shadow_mode)
+            if not target_shadow:
+                ready, reason = await dashboard_service.live_punitive_capability(chat_id=chat_id)
+                if not ready:
+                    await control_repository.set_shadow(chat_id, True)
+                    await safe_callback_answer(callback, reason, show_alert=True)
+                    return
+            enabled = await control_repository.set_shadow(chat_id, target_shadow)
 
             text, keyboard = await build_test_mode_payload(
                 dashboard_service=dashboard_service,
@@ -972,22 +1302,17 @@ async def admin_callback(
             return
 
         elif action == "dash":
-            chat_id = int(
-                parts[2]
-            )
-
+            chat_id = int(parts[2])
+            await safe_callback_answer(callback, toast or "Opening dashboard…")
+            await dashboard_service.reconcile_managed_chats()
             await dashboard_service.open_dashboard(
                 admin_id=admin_id,
                 chat_id=chat_id,
             )
-
-            await callback.answer(
-                toast
-                or "Dashboard updated"
-            )
             return
 
         elif action == "chats":
+            await safe_callback_answer(callback, "Communities")
             text, keyboard = (
                 await dashboard_service
                 .chats_payload(admin_id=admin_id)
@@ -1011,6 +1336,43 @@ async def admin_callback(
                 ),
                 view="chats",
             )
+            return
+
+        elif action == "faq":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.faq_payload(chat_id=chat_id)
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="faq",
+            )
+            await safe_callback_answer(callback, "FAQ")
+            return
+
+        elif action == "ops":
+            if (
+                pilot_access_service is None
+                or not await pilot_access_service.is_superadmin(admin_id)
+            ):
+                await safe_callback_answer(callback, "Superadmin only.", show_alert=True)
+                return
+            await safe_callback_answer(callback, "OPS")
+            await dashboard_service.close_dashboard(admin_id=admin_id)
+            text, keyboard = await pilot_access_service.panel_payload()
+            await pilot_access_service.render_ops_message(
+                superadmin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+            )
+            return
+
+        elif action == "close":
+            # Legacy v1.5.0 callback. v1.5.1 uses Dashboard <-> OPS replacement
+            # instead of separate close controls.
+            await safe_callback_answer(callback, "Use OPS to switch panels.")
+            return
 
         elif action == "policy":
             chat_id = int(parts[2])
@@ -1028,6 +1390,88 @@ async def admin_callback(
             )
 
             await callback.answer("Community policy")
+            return
+
+        elif action == "policy_security":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.policy_security_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="policy_security",
+            )
+            await safe_callback_answer(callback, "Security preset")
+            return
+
+        elif action == "policy_security_apply":
+            chat_id = int(parts[2])
+            preset = str(parts[3]).casefold() if len(parts) > 3 else ""
+            try:
+                version = await community_policy_service.apply_security_preset(
+                    chat_id=chat_id,
+                    admin_id=admin_id,
+                    preset=preset,
+                )
+            except ValueError as exc:
+                await safe_callback_answer(callback, str(exc), show_alert=True)
+                return
+
+            forced_shadow_reason = None
+            if preset == "progressive":
+                settings_row = await control_repository.get_chat_settings(chat_id)
+                if not settings_row.shadow_mode:
+                    ready, reason = await dashboard_service.live_punitive_capability(chat_id=chat_id)
+                    if not ready:
+                        await control_repository.set_shadow(chat_id, True)
+                        forced_shadow_reason = reason
+
+            text, keyboard = await dashboard_service.policy_payload(chat_id=chat_id)
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="policy",
+            )
+            label = "Progressive" if preset == "progressive" else "Strict Core"
+            await safe_callback_answer(
+                callback,
+                (
+                    f"{label} active · policy v{version.version}"
+                    if forced_shadow_reason is None
+                    else f"{label} active · SHADOW forced: {forced_shadow_reason[:120]}"
+                ),
+                show_alert=forced_shadow_reason is not None,
+            )
+            return
+
+        elif action == "policy_details":
+            chat_id = int(parts[2])
+            text, keyboard = await dashboard_service.policy_details_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id, text=text, keyboard=keyboard,
+                selected_chat_id=chat_id, view="policy_details",
+            )
+            await callback.answer("Core policy")
+            return
+
+        elif action == "policy_rules":
+            chat_id = int(parts[2])
+            page = int(parts[3]) if len(parts) > 3 else 0
+            text, keyboard = await dashboard_service.policy_rules_payload(
+                chat_id=chat_id, page=page
+            )
+            await dashboard_service.render(
+                admin_id=admin_id, text=text, keyboard=keyboard,
+                selected_chat_id=chat_id, view="policy_rules",
+            )
+            await callback.answer("Community rules")
             return
 
         elif action == "policy_edit":
@@ -1155,6 +1599,98 @@ async def admin_callback(
 
             await callback.answer(
                 f"Rolled back → v{version.version}"
+            )
+            return
+
+        elif action == "policy_memory_reset":
+            chat_id = int(parts[2])
+
+            version, revoked = (
+                await community_policy_service.reset_adaptive_memory(
+                    chat_id=chat_id,
+                    admin_id=admin_id,
+                )
+            )
+
+            text, keyboard = await dashboard_service.policy_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="policy",
+            )
+            suffix = (
+                f" · policy v{version.version}"
+                if version is not None
+                else ""
+            )
+            await callback.answer(
+                f"Learned memory reset: {revoked}{suffix}"
+            )
+            return
+
+        elif action == "policy_shadow_reset":
+            chat_id = int(parts[2])
+
+            cleared = await control_repository.reset_shadow_simulation(
+                chat_id=chat_id
+            )
+
+            text, keyboard = await dashboard_service.policy_payload(
+                chat_id=chat_id
+            )
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view="policy",
+            )
+            await callback.answer(
+                f"Shadow simulation reset: {cleared}"
+            )
+            return
+
+        elif action == "policy_rule_del":
+            chat_id = int(parts[2])
+            rule_id = parts[3]
+            return_page = int(parts[4]) if len(parts) > 4 else None
+
+            version = await community_policy_service.remove_rule(
+                chat_id=chat_id,
+                admin_id=admin_id,
+                rule_id=rule_id,
+            )
+
+            if version is None:
+                await callback.answer(
+                    "Rule not found.",
+                    show_alert=True,
+                )
+                return
+
+            if return_page is None:
+                text, keyboard = await dashboard_service.policy_payload(
+                    chat_id=chat_id
+                )
+                view = "policy"
+            else:
+                text, keyboard = await dashboard_service.policy_rules_payload(
+                    chat_id=chat_id, page=return_page
+                )
+                view = "policy_rules"
+            await dashboard_service.render(
+                admin_id=admin_id,
+                text=text,
+                keyboard=keyboard,
+                selected_chat_id=chat_id,
+                view=view,
+            )
+            await callback.answer(
+                f"Rule removed · policy v{version.version}"
             )
             return
 
@@ -1325,24 +1861,31 @@ async def admin_callback(
             return
 
         elif action == "shadow":
-            chat_id = int(
-                parts[2]
-            )
+            chat_id = int(parts[2])
+            current_settings = await control_repository.get_chat_settings(chat_id)
+            target_shadow = not bool(current_settings.shadow_mode)
 
-            shadow_enabled = await control_repository.toggle_shadow(
-                chat_id
-            )
+            if not target_shadow:
+                ready, reason = await dashboard_service.live_punitive_capability(chat_id=chat_id)
+                if not ready:
+                    await control_repository.set_shadow(chat_id, True)
+                    text, keyboard = await dashboard_service.settings_payload(chat_id=chat_id)
+                    await dashboard_service.render(
+                        admin_id=admin_id,
+                        text=text,
+                        keyboard=keyboard,
+                        selected_chat_id=chat_id,
+                        view="settings",
+                    )
+                    await safe_callback_answer(callback, reason, show_alert=True)
+                    return
+
+            shadow_enabled = await control_repository.set_shadow(chat_id, target_shadow)
             if not shadow_enabled and safety_circuit is not None:
                 # Human explicitly re-enabled LIVE/DRY behavior after review.
                 safety_circuit.reset_runtime_counters(chat_id)
 
-            text, keyboard = (
-                await dashboard_service
-                .settings_payload(
-                    chat_id=chat_id
-                )
-            )
-
+            text, keyboard = await dashboard_service.settings_payload(chat_id=chat_id)
             await dashboard_service.render(
                 admin_id=admin_id,
                 text=text,
@@ -1350,6 +1893,8 @@ async def admin_callback(
                 selected_chat_id=chat_id,
                 view="settings",
             )
+            await safe_callback_answer(callback, "Shadow ON" if shadow_enabled else "LIVE enabled")
+            return
 
         elif action == "ban_toggle":
             chat_id = int(parts[2])
@@ -1503,9 +2048,15 @@ async def admin_callback(
 
         elif action == "shadow_clear":
             chat_id = int(parts[2])
+            # Clearing transient Shadow cards is intentionally side-effect free for
+            # persistent navigation.  The operator may currently be looking at the
+            # renter dashboard, Platform OPS, or no persistent panel at all; none of
+            # those views should be replaced just because old alert cards were
+            # dismissed.
+            await safe_callback_answer(callback, "Clearing shadow alerts...")
             artifacts = await control_repository.list_admin_alert_artifacts(
                 managed_chat_id=chat_id,
-                kind="shadow_alert",
+                kind_prefix="shadow_alert",
             )
             deleted = 0
             for artifact in artifacts:
@@ -1523,17 +2074,14 @@ async def admin_callback(
                     )
             await control_repository.purge_admin_alert_artifacts(
                 managed_chat_id=chat_id,
-                kind="shadow_alert",
+                kind_prefix="shadow_alert",
             )
-            text, keyboard = await dashboard_service.tools_payload(chat_id=chat_id)
-            await dashboard_service.render(
-                admin_id=admin_id,
-                text=text,
-                keyboard=keyboard,
-                selected_chat_id=chat_id,
-                view="tools",
+            logger.info(
+                "SHADOW ALERTS CLEARED | chat=%s | by=%s | deleted=%s",
+                chat_id,
+                admin_id,
+                deleted,
             )
-            await callback.answer(f"Cleared {deleted} shadow alert(s)")
             return
 
         elif action == "bans":
@@ -1675,41 +2223,69 @@ async def admin_callback(
             )
 
         elif action == "ticket":
-            ticket_id = int(
-                parts[2]
-            )
+            ticket_id = int(parts[2])
 
-            payload = (
-                await dashboard_service
-                .ticket_payload(
-                    ticket_id=ticket_id
-                )
-            )
-
-            if payload is None:
-                await callback.answer(
-                    "Ticket not found.",
+            ticket = await control_repository.get_ticket(ticket_id)
+            if ticket is None:
+                await safe_callback_answer(
+                    callback,
+                    "Review not found.",
                     show_alert=True,
                 )
                 return
 
-            (
-                text,
-                keyboard,
-                chat_id,
-            ) = payload
-
-            if not await can_access_chat(admin_id, chat_id, pilot_access_service):
-                await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
+            if not await can_access_chat(
+                admin_id,
+                ticket.chat_id,
+                pilot_access_service,
+            ):
+                await safe_callback_answer(
+                    callback,
+                    "Not authorized for this community.",
+                    show_alert=True,
+                )
                 return
 
-            await dashboard_service.render(
+            message_id = await dashboard_service.send_ticket_message(
                 admin_id=admin_id,
-                text=text,
-                keyboard=keyboard,
-                selected_chat_id=chat_id,
-                view="ticket",
+                ticket_id=ticket_id,
             )
+            if message_id is None:
+                await safe_callback_answer(
+                    callback,
+                    "Could not open review.",
+                    show_alert=True,
+                )
+                return
+
+            await safe_callback_answer(callback, "Review opened")
+            return
+
+        elif action == "tclose":
+            ticket_id = int(parts[2])
+            ticket = await control_repository.get_ticket(ticket_id)
+            if (
+                ticket is not None
+                and not await can_access_chat(
+                    admin_id,
+                    ticket.chat_id,
+                    pilot_access_service,
+                )
+            ):
+                await safe_callback_answer(
+                    callback,
+                    "Not authorized for this community.",
+                    show_alert=True,
+                )
+                return
+
+            await safe_callback_answer(callback, "Closed")
+            await delete_transient_admin_card(
+                callback=callback,
+                repository=control_repository,
+                admin_id=admin_id,
+            )
+            return
 
         elif action == "tact":
             # Telegram callback queries expire quickly. Acknowledge the click
@@ -1741,6 +2317,32 @@ async def admin_callback(
             if not await can_access_chat(admin_id, ticket.chat_id, pilot_access_service):
                 await safe_callback_answer(callback, "Not authorized for this community.", show_alert=True)
                 return
+
+            if not is_test_ticket(ticket):
+                claimed = await control_repository.claim_ticket_resolution(
+                    ticket_id=ticket_id,
+                    action=ticket_action,
+                )
+                if not claimed:
+                    fresh_ticket = await control_repository.get_ticket(ticket_id)
+                    if fresh_ticket is not None and callback.message is not None:
+                        payload = await dashboard_service.ticket_payload(ticket_id=ticket_id)
+                        if payload is not None:
+                            resolved_text, resolved_keyboard, _ = payload
+                            try:
+                                await callback.message.edit_text(
+                                    text=resolved_text,
+                                    parse_mode="HTML",
+                                    reply_markup=resolved_keyboard,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Could not refresh already claimed ticket card.",
+                                    exc_info=True,
+                                )
+                    return
+                claimed_ticket_id = ticket_id
+                claimed_ticket_action = ticket_action
 
             if is_test_ticket(ticket):
                 success, action_status = await execute_test_ticket_action(
@@ -1800,11 +2402,18 @@ async def admin_callback(
                             ticket.telegram_message_id
                         ),
                     )
+                    claimed_action_committed = True
                 except Exception as exc:
                     logger.warning(
                         "Ticket delete failed",
                         exc_info=True,
                     )
+                    if claimed_ticket_id is not None and claimed_ticket_action is not None:
+                        await control_repository.release_ticket_resolution_claim(
+                            ticket_id=claimed_ticket_id,
+                            action=claimed_ticket_action,
+                        )
+                        claimed_ticket_id = None
                     await safe_callback_answer(callback,
                         "Telegram delete failed: " + str(exc)[:120],
                         show_alert=True,
@@ -1821,6 +2430,7 @@ async def admin_callback(
                     chat_id=ticket.chat_id,
                     user_id=ticket.target_user_id,
                 )
+                claimed_action_committed = True
 
                 # A BAN always includes cleanup of the trigger message.
                 # The ban itself remains successful even if Telegram can no
@@ -1850,6 +2460,18 @@ async def admin_callback(
                 ticket_action == "mute"
                 and ticket.target_user_id is not None
             ):
+                ready, reason = await dashboard_service.live_punitive_capability(
+                    chat_id=ticket.chat_id
+                )
+                if not ready:
+                    if claimed_ticket_id is not None and claimed_ticket_action is not None:
+                        await control_repository.release_ticket_resolution_claim(
+                            ticket_id=claimed_ticket_id,
+                            action=claimed_ticket_action,
+                        )
+                        claimed_ticket_id = None
+                    await safe_callback_answer(callback, reason, show_alert=True)
+                    return
                 duration = await control_repository.get_mute_duration_minutes(ticket.chat_id)
                 await bot.restrict_chat_member(
                     chat_id=ticket.chat_id,
@@ -1863,6 +2485,7 @@ async def admin_callback(
                     ),
                     until_date=datetime.now(timezone.utc) + timedelta(minutes=duration),
                 )
+                claimed_action_committed = True
                 if ticket.telegram_message_id is not None:
                     try:
                         await bot.delete_message(
@@ -1887,8 +2510,18 @@ async def admin_callback(
                         "this message violates the community rules."
                     ),
                 )
+                claimed_action_committed = True
+
+            elif ticket_action == "allow":
+                claimed_action_committed = True
 
             elif ticket_action != "allow":
+                if claimed_ticket_id is not None and claimed_ticket_action is not None:
+                    await control_repository.release_ticket_resolution_claim(
+                        ticket_id=claimed_ticket_id,
+                        action=claimed_ticket_action,
+                    )
+                    claimed_ticket_id = None
                 await safe_callback_answer(callback,
                     "Unsupported action.",
                     show_alert=True,
@@ -1917,31 +2550,15 @@ async def admin_callback(
                 ticket_id=ticket_id,
                 action=ticket_action,
             )
+            claimed_ticket_id = None
 
-            dashboard_service.request_refresh(
-                ticket.chat_id
-            )
+            dashboard_service.request_refresh(ticket.chat_id)
 
-            text, keyboard = (
-                await dashboard_service
-                .tickets_payload(
-                    chat_id=ticket.chat_id
-                )
-            )
-
-            await dashboard_service.render(
-                admin_id=admin_id,
-                text=text,
-                keyboard=keyboard,
-                selected_chat_id=(
-                    ticket.chat_id
-                ),
-                view="tickets",
-            )
-
-            await safe_callback_answer(
-                callback,
-                "Done.",
+            # One ticket can have renter + explicitly monitored platform mirrors.
+            # Resolution is single-winner and removes every mirror together.
+            await dashboard_service.cleanup_ticket_cards(
+                ticket_id=ticket_id,
+                managed_chat_id=ticket.chat_id,
             )
             return
 
@@ -1954,6 +2571,39 @@ async def admin_callback(
         logger.exception(
             "Admin control callback failed"
         )
+
+        if claimed_ticket_id is not None and claimed_ticket_action is not None:
+            try:
+                if claimed_action_committed:
+                    # Telegram action already happened. Finalize instead of
+                    # reopening and risking a duplicate punishment.
+                    recovered_ticket = await control_repository.get_ticket(claimed_ticket_id)
+                    await control_repository.resolve_ticket(
+                        ticket_id=claimed_ticket_id,
+                        action=claimed_ticket_action,
+                    )
+                    if recovered_ticket is not None:
+                        try:
+                            await dashboard_service.cleanup_ticket_cards(
+                                ticket_id=claimed_ticket_id,
+                                managed_chat_id=recovered_ticket.chat_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not cleanup mirrored ticket cards during recovery | ticket=%s",
+                                claimed_ticket_id,
+                                exc_info=True,
+                            )
+                else:
+                    await control_repository.release_ticket_resolution_claim(
+                        ticket_id=claimed_ticket_id,
+                        action=claimed_ticket_action,
+                    )
+            except Exception:
+                logger.exception(
+                    "Ticket claim recovery failed | ticket=%s",
+                    claimed_ticket_id,
+                )
 
         await safe_callback_answer(
             callback,
@@ -1985,9 +2635,7 @@ async def community_policy_text_input(
     ):
         return
 
-    # Optional private Pilot Ops input flow (grant/search/etc.). The public
-    # repository only exposes this hook; the implementation lives in the
-    # git-ignored private_ops package.
+    # Optional external access-provider input hook.
     if pilot_access_service is not None and message.from_user is not None:
         try:
             if await pilot_access_service.handle_private_text(message):
@@ -2004,9 +2652,8 @@ async def community_policy_text_input(
 
     admin_id = message.from_user.id
 
-    # Shadow feedback input is independent from the pinned dashboard. An
-    # authorized moderator can teach ModGuard directly from a Shadow alert even
-    # if the dashboard was not opened in this private chat.
+    # Shadow feedback input is independent from the pinned dashboard. An admin
+    # can receive a Shadow alert and teach ModGuard without opening the dashboard.
     pending_shadow = (
         await control_repository.pending_shadow_feedback_for_admin(
             moderator_admin_id=admin_id
@@ -2035,6 +2682,17 @@ async def community_policy_text_input(
         )
 
         try:
+            try:
+                resolved_shadow_title = await dashboard_service._chat_title(
+                    int(pending_shadow.chat_id)
+                )
+            except Exception:
+                logger.debug(
+                    "Could not resolve pending Shadow feedback community title.",
+                    exc_info=True,
+                )
+                resolved_shadow_title = None
+
             interpretation = (
                 await feedback_service.interpret_shadow_feedback(
                     case=pending_shadow,
@@ -2076,10 +2734,12 @@ async def community_policy_text_input(
                 unsupported_assumptions=(
                     interpretation.unsupported_assumptions
                 ),
+                community_title_override=resolved_shadow_title,
             )
             preview_keyboard = shadow_feedback_keyboard(
                 saved_case.id,
                 stage="confirm",
+                chat_id=saved_case.chat_id,
             )
 
             edited = False
@@ -2116,6 +2776,7 @@ async def community_policy_text_input(
                 shadow_feedback_case_text(
                     pending_shadow,
                     stage="explain",
+                    community_title_override=locals().get("resolved_shadow_title"),
                 )
                 + "\n\n⚠️ <b>I could not interpret that feedback.</b> "
                   "Please try again with a little more detail.\n"
@@ -2131,6 +2792,7 @@ async def community_policy_text_input(
                         reply_markup=shadow_feedback_keyboard(
                             pending_shadow.id,
                             stage="input",
+                            chat_id=pending_shadow.chat_id,
                         ),
                     )
                 else:
@@ -2141,6 +2803,7 @@ async def community_policy_text_input(
                         reply_markup=shadow_feedback_keyboard(
                             pending_shadow.id,
                             stage="input",
+                            chat_id=pending_shadow.chat_id,
                         ),
                     )
             except Exception:

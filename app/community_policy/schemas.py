@@ -12,10 +12,29 @@ EnforcementTier = Literal[
 ]
 
 
+PolicyFamily = Literal[
+    "security_fraud",
+    "threat",
+    "harassment",
+    "spam_flood",
+    "advertising",
+    "adult_content",
+    "impersonation",
+    "evasion",
+    "hate",
+    "other",
+]
+
+
 class CommunityPolicyRule(BaseModel):
     rule_id: str = Field(
         default="",
         max_length=24,
+    )
+    source: Literal["manual", "shadow_feedback"] = "manual"
+    source_ref: int | None = Field(
+        default=None,
+        ge=1,
     )
     title: str = Field(
         min_length=1,
@@ -27,6 +46,9 @@ class CommunityPolicyRule(BaseModel):
     )
     action: ModerationAction
     enforcement_tier: EnforcementTier | None = None
+    # Stable topic family used by Adaptive Shadow reconciliation. Older stored
+    # rules validate as "other" for backwards compatibility.
+    policy_family: PolicyFamily = "other"
     # Kept for backwards compatibility with stored v1 rules. Runtime mute
     # duration is always loaded from the selected chat settings.
     mute_minutes: int | None = Field(
@@ -97,3 +119,48 @@ class CommunityPolicyMatch(BaseModel):
         default_factory=list,
         max_length=5,
     )
+
+
+class ProtectedFeedbackSafetyReview(BaseModel):
+    """Independent safety classification run before learned policy promotion."""
+
+    protected: bool
+    category: Literal[
+        "none",
+        "scam",
+        "phishing",
+        "malicious_link",
+        "threat",
+    ] = "none"
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(min_length=1, max_length=500)
+    current_message_evidence: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+    )
+
+
+class LearnedAllowBoundaryReview(BaseModel):
+    """Safety/context gate for learned harassment/banter ALLOW exceptions."""
+
+    blocked: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(min_length=1, max_length=500)
+    boundary_evidence: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+    )
+
+
+class LearnedRuleReconciliation(BaseModel):
+    """Decide whether a new learned rule adds, replaces, or conflicts."""
+
+    operation: Literal[
+        "add",
+        "replace",
+        "manual_conflict",
+    ]
+    confidence: float = Field(ge=0.0, le=1.0)
+    replace_rule_ids: list[str] = Field(default_factory=list, max_length=8)
+    manual_conflict_rule_ids: list[str] = Field(default_factory=list, max_length=8)
+    reason: str = Field(min_length=1, max_length=500)

@@ -66,6 +66,9 @@ class MessageSnapshot(BaseModel):
 class BehaviorSignals(BaseModel):
     has_urls: bool = False
     url_count: int = 0
+    domain_references: list[str] = Field(default_factory=list)
+    has_obfuscated_domains: bool = False
+    obfuscated_domain_count: int = 0
     mention_count: int = 0
     messages_last_60s: int = 0
     repeated_recent_messages: int = 0
@@ -256,6 +259,10 @@ class PolicyEvaluation(BaseModel):
         default_factory=list,
         max_length=8,
     )
+
+    # Stable family of the winning community rule. Used by Shadow-only
+    # virtual enforcement history; Core callers leave it unset.
+    community_policy_family: str | None = None
 
 
 class ExecutionResult(BaseModel):

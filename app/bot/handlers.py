@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -35,6 +36,16 @@ GROUP_CHAT = F.chat.type.in_(
         ChatType.SUPERGROUP,
     }
 )
+
+
+@asynccontextmanager
+async def _pilot_moderation_slot(pilot_access_service, chat_id: int):
+    slot = getattr(pilot_access_service, "moderation_slot", None) if pilot_access_service is not None else None
+    if callable(slot):
+        async with slot(int(chat_id)) as allowed:
+            yield bool(allowed)
+        return
+    yield True
 
 
 def should_moderate_message(
@@ -95,11 +106,25 @@ async def process_report_rereview(
     )
 
     target_decision, target_policy = (
+        await community_policy_service.apply_core_guard(
+            context=target_context,
+            baseline_decision=target_decision,
+            baseline_policy=target_policy,
+            policy_gate=policy_gate,
+        )
+    )
+    # Freeze an immutable snapshot of Protected Core before any chat-local
+    # Community Policy overlay is applied. This preserves truthful provenance
+    # for Shadow UI, audit and logs even when the effective action is relaxed.
+    target_core_decision = target_decision.model_copy(deep=True)
+    target_core_policy = target_policy.model_copy(deep=True)
+    target_decision, target_policy = (
         await community_policy_service.apply_overlay(
             context=target_context,
             baseline_decision=target_decision,
             baseline_policy=target_policy,
             policy_gate=policy_gate,
+            core_guard_applied=True,
         )
     )
 
@@ -114,6 +139,8 @@ async def process_report_rereview(
             context=target_context,
             decision=target_decision,
             policy=target_policy,
+            core_decision=target_core_decision,
+            core_policy=target_core_policy,
         )
     )
 
@@ -137,14 +164,15 @@ async def process_report_rereview(
         "target_message=%s | "
         "target_user=%s | "
         "category=%s | "
-        "LLM=%s | policy=%s | "
+        "core=%s | policy=%s | effective=%s | "
         "confidence=%.2f | event=%s",
         context.current_message.telegram_message_id,
         target_context.current_message.telegram_message_id,
         target_context.current_message.user_id,
         target_decision.category,
-        target_decision.action,
+        target_core_decision.action,
         target_policy.final_action,
+        target_result.final_action,
         target_decision.confidence,
         target_result.audit_event_key,
     )
@@ -210,7 +238,7 @@ async def process_message(
         chat_title=message.chat.title,
     )
 
-    # Optional private Pilot Edition control plane. When a renter is suspended
+    # Optional external access control. When an administrator is suspended
     # or the platform emergency switch pauses a community, moderation stops
     # before message storage/AI execution. Public builds simply pass None.
     if pilot_access_service is not None:
@@ -362,14 +390,13 @@ async def process_message(
                 context=context,
             )
 
-            decision, policy = (
-                await community_policy_service.apply_overlay(
-                    context=context,
-                    baseline_decision=decision,
-                    baseline_policy=policy,
-                    policy_gate=policy_gate,
-                )
-            )
+            # v1.4.11 REPORTER SAFETY BOUNDARY
+            # A pure report is metadata asking ModGuard to re-review the reply
+            # target. It must never enter chat-local Community Policy, learned
+            # rules, Shadow escalation, or semantic campaign state. Otherwise
+            # a security rule for the TARGET can punish the reporter itself.
+            core_decision = decision.model_copy(deep=True)
+            core_policy = policy.model_copy(deep=True)
 
             result = (
                 await moderation_executor
@@ -377,17 +404,13 @@ async def process_message(
                     context=context,
                     decision=decision,
                     policy=policy,
+                    core_decision=core_decision,
+                    core_policy=core_policy,
                 )
             )
 
-            semantic_cluster_service.enqueue(
-                context=context,
-                decision=decision,
-                policy=policy,
-            )
-
             logger.info(
-                "REPORTER SAFE | "
+                "REPORTER SAFE BYPASS | "
                 "message=%s | user=%s | "
                 "policy=%s | confidence=%.2f | "
                 "event=%s",
@@ -508,11 +531,24 @@ async def process_message(
     )
 
     decision, policy = (
+        await community_policy_service.apply_core_guard(
+            context=context,
+            baseline_decision=decision,
+            baseline_policy=policy,
+            policy_gate=policy_gate,
+        )
+    )
+    # Freeze Protected Core provenance before the chat-local overlay.
+    # Do not let an effective Community Policy action masquerade as AI/Core.
+    core_decision = decision.model_copy(deep=True)
+    core_policy = policy.model_copy(deep=True)
+    decision, policy = (
         await community_policy_service.apply_overlay(
             context=context,
             baseline_decision=decision,
             baseline_policy=policy,
             policy_gate=policy_gate,
+            core_guard_applied=True,
         )
     )
 
@@ -528,6 +564,8 @@ async def process_message(
             context=context,
             decision=decision,
             policy=policy,
+            core_decision=core_decision,
+            core_policy=core_policy,
         )
     )
 
@@ -551,7 +589,7 @@ async def process_message(
         "message=%s | user=%s | "
         "current_violation=%s | "
         "category=%s | severity=%s | "
-        "LLM=%s | policy=%s | "
+        "core=%s | policy=%s | effective=%s | "
         "confidence=%.2f | "
         "report_target=%s | "
         "report_conf=%.2f | "
@@ -565,8 +603,9 @@ async def process_message(
         decision.current_message_violation,
         decision.category,
         decision.severity,
-        decision.action,
+        core_decision.action,
         policy.final_action,
+        result.final_action,
         decision.confidence,
         decision.report_target,
         decision.report_confidence,
@@ -638,7 +677,7 @@ async def register_managed_chat(
                 )
             except Exception:
                 logger.exception(
-                    "Pilot renter chat assignment failed | chat=%s | actor=%s",
+                    "Optional access chat assignment failed | chat=%s | actor=%s",
                     event.chat.id,
                     event.from_user.id,
                 )
@@ -739,35 +778,34 @@ async def observe_message(
     pilot_access_service=None,
 ) -> None:
     try:
-        await process_message(
-        message=message,
-        bot=bot,
-        context_builder=context_builder,
-        moderator_agent=(
-            moderator_agent
-        ),
-        policy_gate=policy_gate,
-        community_policy_service=(
-            community_policy_service
-        ),
-        feedback_service=(
-            feedback_service
-        ),
-        raid_guard_service=(
-            raid_guard_service
-        ),
-        semantic_cluster_service=(
-            semantic_cluster_service
-        ),
-        control_repository=control_repository,
-        moderation_executor=(
-            moderation_executor
-        ),
-        chat_locks=chat_locks,
-            fake_admin_detector=fake_admin_detector,
-            pilot_access_service=pilot_access_service,
-            edited=False,
-        )
+        async with _pilot_moderation_slot(
+            pilot_access_service,
+            message.chat.id,
+        ) as slot_allowed:
+            if not slot_allowed:
+                logger.info(
+                    "OPS COMMUNITY RESET | moderation skipped | chat=%s | message=%s",
+                    message.chat.id,
+                    message.message_id,
+                )
+                return
+            await process_message(
+                message=message,
+                bot=bot,
+                context_builder=context_builder,
+                moderator_agent=moderator_agent,
+                policy_gate=policy_gate,
+                community_policy_service=community_policy_service,
+                feedback_service=feedback_service,
+                raid_guard_service=raid_guard_service,
+                semantic_cluster_service=semantic_cluster_service,
+                control_repository=control_repository,
+                moderation_executor=moderation_executor,
+                chat_locks=chat_locks,
+                fake_admin_detector=fake_admin_detector,
+                pilot_access_service=pilot_access_service,
+                edited=False,
+            )
     except Exception as exc:
         logger.exception(
             "MODERATION PIPELINE FAILED | chat=%s | message=%s",
@@ -809,35 +847,34 @@ async def observe_edited_message(
     pilot_access_service=None,
 ) -> None:
     try:
-        await process_message(
-        message=message,
-        bot=bot,
-        context_builder=context_builder,
-        moderator_agent=(
-            moderator_agent
-        ),
-        policy_gate=policy_gate,
-        community_policy_service=(
-            community_policy_service
-        ),
-        feedback_service=(
-            feedback_service
-        ),
-        raid_guard_service=(
-            raid_guard_service
-        ),
-        semantic_cluster_service=(
-            semantic_cluster_service
-        ),
-        control_repository=control_repository,
-        moderation_executor=(
-            moderation_executor
-        ),
-        chat_locks=chat_locks,
-            fake_admin_detector=fake_admin_detector,
-            pilot_access_service=pilot_access_service,
-            edited=True,
-        )
+        async with _pilot_moderation_slot(
+            pilot_access_service,
+            message.chat.id,
+        ) as slot_allowed:
+            if not slot_allowed:
+                logger.info(
+                    "OPS COMMUNITY RESET | moderation skipped | chat=%s | message=%s",
+                    message.chat.id,
+                    message.message_id,
+                )
+                return
+            await process_message(
+                message=message,
+                bot=bot,
+                context_builder=context_builder,
+                moderator_agent=moderator_agent,
+                policy_gate=policy_gate,
+                community_policy_service=community_policy_service,
+                feedback_service=feedback_service,
+                raid_guard_service=raid_guard_service,
+                semantic_cluster_service=semantic_cluster_service,
+                control_repository=control_repository,
+                moderation_executor=moderation_executor,
+                chat_locks=chat_locks,
+                fake_admin_detector=fake_admin_detector,
+                pilot_access_service=pilot_access_service,
+                edited=True,
+            )
     except Exception as exc:
         logger.exception(
             "EDITED MODERATION PIPELINE FAILED | chat=%s | message=%s",

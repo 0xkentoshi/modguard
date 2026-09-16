@@ -104,6 +104,17 @@ SCAM / PHISHING
 Fake rewards, wallet-connection bait, credential theft, fraudulent payment
 requests and similar deception may justify immediate removal and ban.
 
+DOMAIN / LINK NORMALIZATION
+
+Treat bare and defanged domain notation as an external domain reference even when
+it is not clickable. Examples: example.com, foo[.]xyz, foo(.)ru, scam dot com,
+and scam точка com. The runtime may also provide canonical domain_references.
+
+Do not mark a message malicious merely because a domain exists. However, an
+unsolicited instruction to connect/verify a wallet or account combined with an
+external or defanged domain is strong scam/phishing evidence and must not be
+downgraded to SAFE just because the link is obfuscated or lacks https://.
+
 A clear reward/giveaway/money lure combined with an external action or link can
 be obvious scam/spam when the message semantics support that conclusion.
 Do not send an obvious high-confidence scam to human review merely because it
@@ -514,6 +525,15 @@ def build_moderation_prompt(
             ),
             "url_count": (
                 context.behavior_signals.url_count
+            ),
+            "domain_references": (
+                context.behavior_signals.domain_references
+            ),
+            "has_obfuscated_domains": (
+                context.behavior_signals.has_obfuscated_domains
+            ),
+            "obfuscated_domain_count": (
+                context.behavior_signals.obfuscated_domain_count
             ),
             "messages_last_60s": (
                 context.behavior_signals.messages_last_60s

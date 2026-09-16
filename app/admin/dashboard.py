@@ -246,6 +246,15 @@ class DashboardService:
         if self.access_service is None:
             return chats
         try:
+            dashboard_scope = getattr(
+                self.access_service,
+                "list_dashboard_chat_ids",
+                None,
+            )
+            if callable(dashboard_scope):
+                allowed_ids = set(await dashboard_scope(admin_id))
+                return [chat for chat in chats if chat.chat_id in allowed_ids]
+
             if await self.access_service.is_superadmin(admin_id):
                 return chats
             allowed_ids = set(await self.access_service.list_allowed_chat_ids(admin_id))
@@ -253,6 +262,15 @@ class DashboardService:
         except Exception:
             logger.exception("Pilot chat visibility failed | admin=%s", admin_id)
             return []
+
+    async def is_superadmin(self, admin_id: int) -> bool:
+        if self.access_service is None:
+            return int(admin_id) in self.admin_ids
+        try:
+            return bool(await self.access_service.is_superadmin(int(admin_id)))
+        except Exception:
+            logger.exception("Could not resolve superadmin UI scope | admin=%s", admin_id)
+            return int(admin_id) in self.admin_ids
 
     async def admin_can_access_chat(self, admin_id: int, chat_id: int) -> bool:
         if self.access_service is None:
@@ -285,7 +303,55 @@ class DashboardService:
                 return chat.title
         return str(chat_id)
 
-    async def dashboard_payload(self, *, chat_id: int):
+    async def live_punitive_capability(
+        self,
+        *,
+        chat_id: int,
+    ) -> tuple[bool, str]:
+        """Check whether Telegram can execute LIVE mute/restrict actions."""
+        get_chat = getattr(self.bot, "get_chat", None)
+        get_me = getattr(self.bot, "get_me", None)
+        get_chat_member = getattr(self.bot, "get_chat_member", None)
+        if not callable(get_chat):
+            return True, "Telegram capability unknown"
+
+        try:
+            tg_chat = await get_chat(chat_id)
+            raw_type = getattr(tg_chat, "type", "")
+            chat_type = str(getattr(raw_type, "value", raw_type)).casefold()
+            if chat_type != "supergroup":
+                return (
+                    False,
+                    "LIVE mute/progressive moderation requires a Telegram supergroup. "
+                    "This chat is a basic group; keep SHADOW on or upgrade the group.",
+                )
+
+            if not callable(get_me) or not callable(get_chat_member):
+                return True, "Supergroup detected; bot permissions not preflighted"
+
+            me = await get_me()
+            member = await get_chat_member(chat_id, me.id)
+            raw_status = getattr(member, "status", "")
+            status = str(getattr(raw_status, "value", raw_status)).casefold()
+            if status not in {"administrator", "creator"}:
+                return False, "ModGuard must be an administrator for LIVE moderation."
+            if not bool(getattr(member, "can_restrict_members", False)):
+                return False, "ModGuard needs the Restrict members permission for LIVE mute/progressive moderation."
+            return True, "LIVE punitive actions ready"
+        except Exception as exc:
+            logger.warning(
+                "LIVE CAPABILITY PREFLIGHT FAILED | chat=%s | %s",
+                chat_id,
+                exc,
+            )
+            return False, f"Could not verify Telegram LIVE permissions: {compact(str(exc), 120)}"
+
+    async def dashboard_payload(
+        self,
+        *,
+        chat_id: int,
+        admin_id: int | None = None,
+    ):
         settings = await self.repository.get_chat_settings(chat_id)
         summary = await self.repository.get_activity_summary(chat_id=chat_id, hours=24)
         tickets = await self.repository.count_open_tickets(chat_id)
@@ -295,9 +361,7 @@ class DashboardService:
             None,
         )
         if callable(feedback_reader):
-            shadow_feedback = await feedback_reader(
-                chat_id=chat_id
-            )
+            shadow_feedback = await feedback_reader(chat_id=chat_id)
         else:
             shadow_feedback = {
                 "confirmed": 0,
@@ -306,52 +370,96 @@ class DashboardService:
             }
         title = await self._chat_title(chat_id)
 
-        if settings.shadow_mode:
+        # Runtime pause is an OPS state, not a moderation-mode setting.  The
+        # renter dashboard must surface it first; otherwise a paused community
+        # misleadingly appears LIVE even though handlers intentionally skip it.
+        paused = False
+        if self.access_service is not None:
+            try:
+                global_pause_reader = getattr(self.access_service, "global_pause", None)
+                local_pause_reader = getattr(self.access_service, "community_paused", None)
+                if callable(global_pause_reader) and await global_pause_reader():
+                    paused = True
+                elif callable(local_pause_reader) and await local_pause_reader(chat_id):
+                    paused = True
+            except Exception:
+                logger.exception("Could not resolve community pause state | chat=%s", chat_id)
+
+        if paused:
+            mode = "PAUSED"
+            mode_icon = "🔴"
+        elif settings.shadow_mode:
             mode = "SHADOW"
+            mode_icon = "🟡"
         elif not self.global_dry_run and self.live_delete_enabled:
             mode = "LIVE"
+            mode_icon = "🟢"
         else:
             mode = "DRY RUN"
+            mode_icon = "⚪"
 
         feedback_line = ""
         if shadow_feedback["confirmed"]:
-            agreement = (
-                shadow_feedback["agreed"]
-                / shadow_feedback["confirmed"]
-            )
+            agreement = shadow_feedback["agreed"] / shadow_feedback["confirmed"]
             feedback_line = (
-                "\nShadow feedback "
-                f"{shadow_feedback['confirmed']} · "
-                f"agreement {agreement:.0%} · "
-                f"corrected {shadow_feedback['corrected']}"
+                f"\nAI feedback {shadow_feedback['confirmed']} · "
+                f"{agreement:.0%} agreement"
             )
 
         text = (
             "<b>🛡 MODGUARD</b>\n"
-            f"{esc(title)} · <b>{mode}</b>\n\n"
-            "<b>24h</b>\n"
-            f"Deleted {summary.deleted} · Banned {summary.banned} · Muted {summary.muted} · Warned {summary.warned}\n"
-            f"Tickets {tickets} · Reviews {summary.reviews}"
+            f"{esc(title)}\n"
+            f"{mode_icon} <b>{mode}</b> · Needs review <b>{tickets}</b>\n\n"
+            "<b>24h</b>  "
+            f"{summary.total} events\n"
+            f"Ban {summary.banned} · Mute {summary.muted} · "
+            f"Warn {summary.warned} · Delete {summary.deleted}"
             f"{feedback_line}"
         )
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"⚠️ Tickets · {tickets}", callback_data=f"mg:tickets:{chat_id}")],
-                [
-                    InlineKeyboardButton(text="📊 Activity", callback_data=f"mg:activity:{chat_id}:24"),
-                    InlineKeyboardButton(text="⚙️ Settings", callback_data=f"mg:settings:{chat_id}"),
-                ],
-                [
-                    InlineKeyboardButton(text="🧪 Test mode", callback_data=f"mg:test:{chat_id}"),
-                ],
-                [
-                    InlineKeyboardButton(text="🔄 Refresh", callback_data=f"mg:dash:{chat_id}"),
-                    InlineKeyboardButton(text="💬 Change chat", callback_data="mg:chats"),
-                ],
-            ]
-        )
-        return text, keyboard
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=f"⚠ Open reviews · {tickets}",
+                    callback_data=f"mg:tickets:{chat_id}",
+                ),
+                InlineKeyboardButton(
+                    text="📊 Statistics",
+                    callback_data=f"mg:activity:{chat_id}:24",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧠 Policy",
+                    callback_data=f"mg:policy:{chat_id}",
+                ),
+                InlineKeyboardButton(
+                    text="⚙ Controls",
+                    callback_data=f"mg:settings:{chat_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Communities",
+                    callback_data="mg:chats",
+                ),
+                InlineKeyboardButton(
+                    text="❓ FAQ",
+                    callback_data=f"mg:faq:{chat_id}",
+                ),
+            ],
+        ]
+
+        if admin_id is not None and await self.is_superadmin(admin_id):
+            rows.append([
+                InlineKeyboardButton(text="👑 OPS", callback_data="mg:ops"),
+            ])
+
+        rows.append([
+            InlineKeyboardButton(text="🔄 Refresh", callback_data=f"mg:dash:{chat_id}")
+        ])
+
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def settings_payload(self, *, chat_id: int):
         settings = await self.repository.get_chat_settings(chat_id)
@@ -371,20 +479,20 @@ class DashboardService:
             if not self.raid_guard_available
             else ("ON" if raid_guard_enabled else "OFF")
         )
+        live_ready, live_reason = await self.live_punitive_capability(chat_id=chat_id)
+        live_status = "✅ READY" if live_ready else "⚠ LIMITED"
 
         text = (
-            "<b>⚙️ SETTINGS</b>\n"
-            f"{esc(title)}\n"
-            "<i>Only everyday controls live here. Safety/diagnostics/history moved to Tools.</i>\n\n"
+            "<b>⚙ CONTROLS</b>\n"
+            f"{esc(title)}\n\n"
             f"Shadow         <b>{shadow}</b>\n"
             f"Live cleanup   <b>{cleanup}</b>\n"
             f"Auto-ban       <b>{autoban}</b>\n"
             f"Mute duration  <b>{esc(mute_duration)}</b>\n"
             f"Light memory   <b>{esc(light_memory)}</b>\n"
-            f"Raid Guard     <b>{raid}</b>\n\n"
-            "Light memory affects only minor spam/flood/harassment escalation. "
-            "After the window expires, a new LIGHT offense starts from warning again. "
-            "MEDIUM/HEAVY safety history does not decay."
+            f"Raid Guard     <b>{raid}</b>\n"
+            f"LIVE actions   <b>{live_status}</b>"
+            + ("" if live_ready else f"\n{esc(live_reason)}")
         )
 
         keyboard = InlineKeyboardMarkup(
@@ -415,19 +523,35 @@ class DashboardService:
                         callback_data=f"mg:raid_toggle:{chat_id}",
                     ),
                     InlineKeyboardButton(
-                        text="📜 Policy",
-                        callback_data=f"mg:policy:{chat_id}",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
                         text="🧰 Safety & tools",
                         callback_data=f"mg:tools:{chat_id}",
-                    )
+                    ),
                 ],
                 [InlineKeyboardButton(text="◀ Dashboard", callback_data=f"mg:dash:{chat_id}")],
             ]
         )
+        return text, keyboard
+
+    async def faq_payload(self, *, chat_id: int):
+        title = await self._chat_title(chat_id)
+        text = (
+            "<b>❓ MODGUARD FAQ</b>\n"
+            f"{esc(title)}\n\n"
+            "<b>SHADOW</b> · analyzes and shows actions without punishing users.\n"
+            "<b>LIVE</b> · executes enabled moderation actions in Telegram.\n\n"
+            "<b>Open reviews</b> · ambiguous cases arrive as separate cards. "
+            "After a successful decision the card removes itself.\n\n"
+            "<b>Policy</b> · community-specific behavior. Use Security preset for "
+            "common scam handling; use AI custom policy only for unusual rules.\n\n"
+            "<b>AI decision wrong</b> · correct a specific AI judgment. It is not "
+            "the main settings screen. Learned memory stays inside this community.\n\n"
+            "<b>Protected Core</b> · scam/phishing/malicious-link and credible threat "
+            "safety cannot be disabled below its safety floor.\n\n"
+            "<b>Safety & tools</b> · diagnostics, bans, immunity, tests and investigation tools."
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀ Dashboard", callback_data=f"mg:dash:{chat_id}")
+        ]])
         return text, keyboard
 
     async def light_memory_payload(self, *, chat_id: int):
@@ -468,10 +592,8 @@ class DashboardService:
         text = (
             "<b>🧰 SAFETY & TOOLS</b>\n"
             f"{esc(title)}\n\n"
-            "Operational tools, safety controls and investigation views are kept "
-            "separate from everyday settings.\n\n"
             f"Immunity entries: <b>{immunity_count}</b>\n"
-            "Auto-stop: <b>ARMED</b> · abnormal action bursts or repeated failures force SHADOW."
+            "Auto-stop: <b>ARMED</b>"
         )
 
         rows = [
@@ -479,6 +601,7 @@ class DashboardService:
                 InlineKeyboardButton(text="⚖️ Safety policy", callback_data=f"mg:safety:{chat_id}"),
                 InlineKeyboardButton(text="🩺 Diagnostics", callback_data=f"mg:diag:{chat_id}"),
             ],
+            [InlineKeyboardButton(text="🧪 Test mode", callback_data=f"mg:test:{chat_id}")],
             [
                 InlineKeyboardButton(text="🚫 Banned users", callback_data=f"mg:bans:{chat_id}"),
                 InlineKeyboardButton(text="🧿 Immunity", callback_data=f"mg:immune:{chat_id}"),
@@ -736,128 +859,263 @@ class DashboardService:
         chat_id: int,
     ):
         title = await self._chat_title(chat_id)
-        active = await self.repository.get_active_community_policy(
-            chat_id
+        active = await self.repository.get_active_community_policy(chat_id)
+        rules = parse_rules_json(active.rules_json if active is not None else "[]")
+        learned_rules = [rule for rule in rules if rule.source == "shadow_feedback"]
+        shadow_stats = await self.repository.shadow_feedback_stats(chat_id=chat_id)
+        shadow_simulation = await self.repository.count_shadow_simulation_events(
+            chat_id=chat_id
         )
 
-        core_lines = "\n".join(
-            f"✓ {esc(item)}"
-            for item in CORE_POLICY_ITEMS
-        )
+        policy_version = f"v{active.version}" if active is not None else "default"
+        confirmed = int(shadow_stats.get("confirmed", 0) or 0)
+        agreed = int(shadow_stats.get("agreed", 0) or 0)
+        agreement = (agreed / confirmed * 100.0) if confirmed else 0.0
 
-        allowed_lines = "\n".join(
-            f"• {esc(item)}"
-            for item in CORE_DEFAULT_ALLOWED_ITEMS
-        )
-
-        tier_lines = "\n".join(
-            f"• {esc(item)}"
-            for item in DEFAULT_ENFORCEMENT_TIER_ITEMS
-        )
-
-        rules = parse_rules_json(
-            active.rules_json
-            if active is not None
-            else "[]"
-        )
-
-        if active is None or not rules:
-            custom = (
-                "<b>Custom overlay</b> · none\n"
-                "No custom rules yet."
-            )
+        security_rules = [
+            rule for rule in rules
+            if rule.policy_family == "security_fraud"
+        ]
+        if not security_rules:
+            security_mode = "STRICT CORE"
+        elif (
+            len(security_rules) == 1
+            and security_rules[0].action == "mute"
+            and security_rules[0].enforcement_tier == "medium"
+        ):
+            security_mode = "PROGRESSIVE"
         else:
-            custom_lines = []
-            action_labels = {
-                "allow": "ALLOW",
-                "warn": "WARN",
-                "delete": "DELETE",
-                "mute": "MUTE",
-                "ban": "BAN",
-                "escalate": "REVIEW",
-            }
-
-            for rule in rules[:6]:
-                suffix = (f" · {rule.enforcement_tier.upper()}" if rule.enforcement_tier else "")
-
-                custom_lines.append(
-                    f"<b>{esc(rule.rule_id)} · "
-                    f"{action_labels.get(rule.action, rule.action.upper())}"
-                    f"{suffix}</b>\n"
-                    f"{esc(compact(rule.condition, 180))}"
-                )
-
-            if len(rules) > 6:
-                custom_lines.append(
-                    f"… {len(rules) - 6} more rules"
-                )
-
-            custom = (
-                f"<b>Custom overlay · v{active.version}</b>\n"
-                + "\n\n".join(custom_lines)
-            )
+            security_mode = "CUSTOM"
 
         text = (
-            "<b>📜 COMMUNITY POLICY</b>\n"
-            f"{esc(title)}\n"
-            "<i>Custom rules apply only to this selected chat.</i>\n\n"
+            "<b>🧠 COMMUNITY POLICY</b>\n"
+            f"{esc(title)}\n\n"
+            f"Security <b>{esc(security_mode)}</b>\n"
+            "<b>Version</b> · "
+            f"{esc(policy_version)}\n"
+            "<b>Rules</b> · "
+            f"{len(rules)}   "
+            "<b>Learned</b> · "
+            f"{len(learned_rules)}\n"
+            f"Feedback {confirmed}"
+            + (f" · {agreement:.0f}% agreement" if confirmed else "")
+            + f" · Shadow sim {shadow_simulation}"
+        )
+
+        rows = [[
+            InlineKeyboardButton(
+                text="🧱 Strict Core",
+                callback_data=f"mg:policy_security_apply:{chat_id}:strict",
+            ),
+            InlineKeyboardButton(
+                text="📈 Progressive",
+                callback_data=f"mg:policy_security_apply:{chat_id}:progressive",
+            ),
+        ], [
+            InlineKeyboardButton(
+                text=f"📋 Rules ({len(rules)})",
+                callback_data=f"mg:policy_rules:{chat_id}:0",
+            ),
+            InlineKeyboardButton(
+                text="⚙ Advanced policy",
+                callback_data=f"mg:policy_security:{chat_id}",
+            ),
+        ]]
+
+        if active is not None:
+            previous = await self.repository.get_previous_community_policy(
+                chat_id, before_version=active.version
+            )
+            if previous is not None:
+                rows.append([InlineKeyboardButton(
+                    text="↩ Previous version",
+                    callback_data=f"mg:policy_prev:{chat_id}",
+                )])
+            if rules:
+                rows.append([InlineKeyboardButton(
+                    text="🧹 Clear custom rules",
+                    callback_data=f"mg:policy_clear:{chat_id}",
+                )])
+
+        if confirmed > 0:
+            rows.append([InlineKeyboardButton(
+                text=f"🧠 Reset learned memory ({confirmed})",
+                callback_data=f"mg:policy_memory_reset:{chat_id}",
+            )])
+
+        if shadow_simulation > 0:
+            rows.append([InlineKeyboardButton(
+                text=f"♻ Reset Shadow simulation ({shadow_simulation})",
+                callback_data=f"mg:policy_shadow_reset:{chat_id}",
+            )])
+
+        rows.append([InlineKeyboardButton(
+            text="◀ Dashboard",
+            callback_data=f"mg:dash:{chat_id}",
+        )])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def policy_security_payload(self, *, chat_id: int):
+        title = await self._chat_title(chat_id)
+        active = await self.repository.get_active_community_policy(chat_id)
+        rules = parse_rules_json(active.rules_json if active is not None else "[]")
+        security_rules = [rule for rule in rules if rule.policy_family == "security_fraud"]
+        if not security_rules:
+            current = "STRICT CORE"
+        elif (
+            len(security_rules) == 1
+            and security_rules[0].action == "mute"
+            and security_rules[0].enforcement_tier == "medium"
+        ):
+            current = "PROGRESSIVE"
+        else:
+            current = "CUSTOM"
+
+        text = (
+            "<b>🛡 SECURITY PRESET</b>\n"
+            f"{esc(title)}\n\n"
+            f"Current: <b>{esc(current)}</b>\n\n"
+            "<b>Strict Core</b> · confirmed scam/phishing keeps Core enforcement.\n"
+            "<b>Progressive</b> · first unique confirmed offense MUTE + DELETE; "
+            "repeat unique offense by the same user BAN + DELETE.\n\n"
+            "Only the security_fraud family changes. Other community rules stay untouched.\n\n"
+            "LIVE Progressive requires a Telegram supergroup with Restrict members permission; "
+            "otherwise ModGuard keeps the community in SHADOW."
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧱 Strict Core",
+                    callback_data=f"mg:policy_security_apply:{chat_id}:strict",
+                ),
+                InlineKeyboardButton(
+                    text="📈 Progressive",
+                    callback_data=f"mg:policy_security_apply:{chat_id}:progressive",
+                ),
+            ],
+            [InlineKeyboardButton(
+                text="✏️ Advanced custom policy with AI",
+                callback_data=f"mg:policy_edit:{chat_id}",
+            )],
+            [InlineKeyboardButton(
+                text="📖 Theory & core rules",
+                callback_data=f"mg:policy_details:{chat_id}",
+            )],
+            [InlineKeyboardButton(
+                text="◀ Community Policy",
+                callback_data=f"mg:policy:{chat_id}",
+            )],
+        ])
+        return text, keyboard
+
+    async def policy_details_payload(
+        self,
+        *,
+        chat_id: int,
+    ):
+        title = await self._chat_title(chat_id)
+        core_lines = "\n".join(f"✓ {esc(item)}" for item in CORE_POLICY_ITEMS)
+        allowed_lines = "\n".join(f"• {esc(item)}" for item in CORE_DEFAULT_ALLOWED_ITEMS)
+        tier_lines = "\n".join(f"• {esc(item)}" for item in DEFAULT_ENFORCEMENT_TIER_ITEMS)
+        text = (
+            "<b>📖 POLICY THEORY & CORE RULES</b>\n"
+            f"{esc(title)}\n\n"
             "<b>PROTECTED CORE · CANNOT BE WEAKENED</b>\n"
+            "Classification cannot be disabled for protected categories.\n"
             f"{core_lines}\n\n"
             "<b>DEFAULT ENFORCEMENT · CUSTOMIZABLE</b>\n"
             f"{tier_lines}\n\n"
             "<b>DEFAULT · ALLOWED</b>\n"
             f"{allowed_lines}\n\n"
-            f"{custom}\n\n"
+            "<b>HOW COMMUNITY LEARNING WORKS</b>\n"
+            "• Every Shadow event belongs to exactly one community.\n"
+            "• An administrator may receive Shadow events from several managed communities in the same private feed.\n"
+            "• The event card always shows which community produced it.\n"
+            "• Confirmed corrections become rules only for that event's community.\n"
+            "• Learned rules can be inspected and removed individually.\n"
+            "• Pair-specific relationship feedback stays pair-scoped instead of becoming a chat-wide rule.\n"
+            "• Scam/phishing/malicious-link classification cannot become ALLOW, but enforcement may be calibrated down to the safe MUTE + DELETE floor.\n"
+            "• Credible direct threats keep the BAN + DELETE floor.\n"
+            "• Shadow Mode never performs destructive moderation actions.\n"
+            "• Shadow keeps a separate per-community, per-user, per-policy-family simulation ledger so escalation ladders can be tested safely.\n"
+            "• Reset Shadow simulation clears only that virtual ladder state; it never changes LIVE moderation history.\n\n"
             f"<i>{esc(CORE_POLICY_NOTE)}</i>"
         )
-
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text="✏️ Add / change rules",
-                    callback_data=f"mg:policy_edit:{chat_id}",
-                )
-            ]
-        ]
-
-        if active is not None:
-            previous = await self.repository.get_previous_community_policy(
-                chat_id,
-                before_version=active.version,
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="◀ Community Policy",
+                callback_data=f"mg:policy:{chat_id}",
             )
+        ]])
+        return text, keyboard
 
-            if previous is not None:
-                rows.append(
-                    [
-                        InlineKeyboardButton(
-                            text="↩ Previous version",
-                            callback_data=f"mg:policy_prev:{chat_id}",
-                        )
-                    ]
+    async def policy_rules_payload(
+        self,
+        *,
+        chat_id: int,
+        page: int = 0,
+    ):
+        title = await self._chat_title(chat_id)
+        active = await self.repository.get_active_community_policy(chat_id)
+        rules = parse_rules_json(active.rules_json if active is not None else "[]")
+        per_page = 5
+        max_page = max(0, (len(rules) - 1) // per_page)
+        page = max(0, min(page, max_page))
+        chunk = rules[page * per_page:(page + 1) * per_page]
+        labels = {
+            "allow": "ALLOW", "warn": "WARN", "delete": "DELETE",
+            "mute": "MUTE + DELETE", "ban": "BAN + DELETE", "escalate": "REVIEW",
+        }
+        if not chunk:
+            body = "No custom rules yet."
+        else:
+            blocks = []
+            tier_hint = {
+                "light": "per-user: WARN → MUTE + DELETE → BAN + DELETE",
+                "medium": "per-user: MUTE + DELETE → BAN + DELETE",
+                "heavy": "BAN + DELETE immediately",
+            }
+            for rule in chunk:
+                learned = " · 🧠 learned" if rule.source == "shadow_feedback" else ""
+                tier = f" · {rule.enforcement_tier.upper()}" if rule.enforcement_tier else ""
+                hint = (
+                    f"\n↳ {tier_hint[rule.enforcement_tier]}"
+                    if rule.enforcement_tier in tier_hint
+                    else ""
                 )
-
-            if rules:
-                rows.append(
-                    [
-                        InlineKeyboardButton(
-                            text="🧹 Clear custom rules",
-                            callback_data=f"mg:policy_clear:{chat_id}",
-                        )
-                    ]
+                blocks.append(
+                    f"<b>{esc(rule.rule_id)} · {labels.get(rule.action, rule.action.upper())}{tier}{learned}</b>\n"
+                    f"{esc(compact(rule.condition, 360))}{hint}"
                 )
-
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="◀ Settings",
-                    callback_data=f"mg:settings:{chat_id}",
-                )
-            ]
+            body = "\n\n".join(blocks)
+        text = (
+            "<b>📋 COMMUNITY RULES</b>\n"
+            f"{esc(title)}\n"
+            f"{len(rules)} rule(s) · page {page + 1}/{max_page + 1}\n\n"
+            f"{body}"
         )
-
-        return text, InlineKeyboardMarkup(
-            inline_keyboard=rows
-        )
+        rows = []
+        for rule in chunk:
+            rows.append([InlineKeyboardButton(
+                text=f"🗑 Remove {rule.rule_id}",
+                callback_data=f"mg:policy_rule_del:{chat_id}:{rule.rule_id}:{page}",
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀", callback_data=f"mg:policy_rules:{chat_id}:{page - 1}"
+            ))
+        if page < max_page:
+            nav.append(InlineKeyboardButton(
+                text="▶", callback_data=f"mg:policy_rules:{chat_id}:{page + 1}"
+            ))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton(
+            text="◀ Community Policy",
+            callback_data=f"mg:policy:{chat_id}",
+        )])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def policy_input_payload(
         self,
@@ -943,8 +1201,8 @@ class DashboardService:
             "allow": "ALLOW",
             "warn": "WARN",
             "delete": "DELETE",
-            "mute": "MUTE",
-            "ban": "BAN",
+            "mute": "MUTE + DELETE",
+            "ban": "BAN + DELETE",
             "escalate": "REVIEW",
         }
 
@@ -1298,7 +1556,7 @@ class DashboardService:
             f"Banned      <b>{summary.banned}</b>\n"
             f"Muted       <b>{summary.muted}</b>\n"
             f"Warned      <b>{summary.warned}</b>\n"
-            f"Reviews     <b>{summary.reviews}</b>\n"
+            f"Open reviews <b>{summary.reviews}</b>\n"
             f"Delete fail <b>{summary.failed_deletes}</b>"
         )
 
@@ -1318,9 +1576,9 @@ class DashboardService:
         tickets = await self.repository.list_open_tickets(chat_id=chat_id, limit=20)
         title = await self._chat_title(chat_id)
         text = (
-            "<b>⚠️ TICKETS</b>\n"
+            "<b>⚠ REVIEWS</b>\n"
             f"{esc(title)}\n\n"
-            + (f"Open: <b>{len(tickets)}</b>\nChoose a case to review." if tickets else "No open tickets.")
+            + (f"Open <b>{len(tickets)}</b> · tap a case to open a separate review card." if tickets else "No open reviews.")
         )
 
         rows = []
@@ -1343,12 +1601,15 @@ class DashboardService:
 
         who = ticket.username or (f"user {ticket.target_user_id}" if ticket.target_user_id else "unknown")
         confidence = f"{ticket.confidence:.0%}" if ticket.confidence is not None else "—"
+        community_title = await self._chat_title(ticket.chat_id)
 
         text = (
-            f"<b>⚠️ {esc(ticket.ticket_key)}</b>\n"
-            f"{esc(who)} · {esc(ticket.category)} · {confidence}\n\n"
-            f"<b>Message</b>\n<code>{esc(compact(ticket.message_text))}</code>\n\n"
-            f"<b>Why review</b>\n{esc(compact(ticket.reason, 350))}"
+            "<b>⚠ MODERATION REVIEW</b>\n"
+            f"{esc(community_title)}\n"
+            f"{esc(who)} · {esc(ticket.category)} · {confidence}\n"
+            f"<code>{esc(ticket.ticket_key)}</code>\n\n"
+            f"<code>{esc(compact(ticket.message_text))}</code>\n\n"
+            f"<b>Why</b>\n{esc(compact(ticket.reason, 350))}"
         )
         try:
             context_payload = json.loads(ticket.context_json or "{}")
@@ -1371,6 +1632,17 @@ class DashboardService:
         if ticket.occurrence_count > 1:
             text += f"\n\nSeen in this ticket: <b>{ticket.occurrence_count}</b>"
 
+        if str(ticket.status) != "open":
+            resolution = esc(ticket.resolution_action or ticket.status)
+            text += (
+                f"\n\n<b>Status</b> · {esc(str(ticket.status).upper())}"
+                f" · {resolution}"
+            )
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✕ Close card", callback_data=f"mg:tclose:{ticket.id}")
+            ]])
+            return text, keyboard, ticket.chat_id
+
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1384,7 +1656,7 @@ class DashboardService:
                 [
                     InlineKeyboardButton(text="✅ Allow", callback_data=f"mg:tact:{ticket.id}:allow"),
                 ],
-                [InlineKeyboardButton(text="◀ Tickets", callback_data=f"mg:tickets:{ticket.chat_id}")],
+                [InlineKeyboardButton(text="✕ Close card", callback_data=f"mg:tclose:{ticket.id}")],
             ]
         )
         return text, keyboard, ticket.chat_id
@@ -1396,7 +1668,89 @@ class DashboardService:
             [InlineKeyboardButton(text=chat.title[:60], callback_data=f"mg:dash:{chat.chat_id}")]
             for chat in chats
         ]
-        return "<b>💬 CHATS</b>\n\nChoose a community.", InlineKeyboardMarkup(inline_keyboard=rows)
+        if not chats:
+            body = "No communities in this dashboard scope."
+        else:
+            body = f"{len(chats)} communities · choose one."
+        if await self.is_superadmin(admin_id):
+            rows.append([InlineKeyboardButton(text="👑 OPS · all tenants", callback_data="mg:ops")])
+        return (
+            "<b>💬 COMMUNITIES</b>\n\n" + body,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def send_ticket_message(self, *, admin_id: int, ticket_id: int) -> int | None:
+        payload = await self.ticket_payload(ticket_id=ticket_id)
+        if payload is None:
+            return None
+        text, keyboard, chat_id = payload
+        if not await self.admin_can_access_chat(admin_id, chat_id):
+            return None
+        message = await self.bot.send_message(
+            chat_id=admin_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        register = getattr(self.repository, "register_admin_alert_artifact", None)
+        if callable(register):
+            try:
+                await register(
+                    managed_chat_id=chat_id,
+                    admin_chat_id=admin_id,
+                    telegram_message_id=message.message_id,
+                    kind=f"ticket_card:{ticket_id}",
+                )
+            except Exception:
+                logger.debug("Could not register ticket card artifact.", exc_info=True)
+        return int(message.message_id)
+
+    async def cleanup_ticket_cards(self, *, ticket_id: int, managed_chat_id: int) -> int:
+        """Delete every DM mirror of one resolved review ticket."""
+        list_artifacts = getattr(self.repository, "list_admin_alert_artifacts", None)
+        purge_artifacts = getattr(self.repository, "purge_admin_alert_artifacts", None)
+        if not callable(list_artifacts) or not callable(purge_artifacts):
+            return 0
+        kind = f"ticket_card:{int(ticket_id)}"
+        artifacts = await list_artifacts(
+            managed_chat_id=int(managed_chat_id),
+            kind=kind,
+        )
+        deleted = 0
+        for artifact in artifacts:
+            try:
+                await self.bot.delete_message(
+                    chat_id=int(artifact.admin_chat_id),
+                    message_id=int(artifact.telegram_message_id),
+                )
+                deleted += 1
+            except Exception:
+                logger.debug(
+                    "Could not delete mirrored ticket card | ticket=%s | artifact=%s",
+                    ticket_id,
+                    getattr(artifact, "id", None),
+                    exc_info=True,
+                )
+        await purge_artifacts(
+            managed_chat_id=int(managed_chat_id),
+            kind=kind,
+        )
+        return deleted
+
+    async def close_dashboard(self, *, admin_id: int) -> bool:
+        state = await self.repository.get_dashboard_state(admin_id)
+        if state is None or state.dashboard_message_id is None:
+            await self.repository.clear_dashboard_state(admin_id)
+            return False
+        try:
+            await self.bot.delete_message(
+                chat_id=admin_id,
+                message_id=state.dashboard_message_id,
+            )
+        except Exception:
+            logger.debug("Could not delete dashboard while closing.", exc_info=True)
+        await self.repository.clear_dashboard_state(admin_id)
+        return True
 
     async def render(
         self,
@@ -1485,16 +1839,21 @@ class DashboardService:
             chat_id = await self._choose_chat(admin_id)
 
         if chat_id is None:
+            rows = []
+            text = "<b>🛡 MODGUARD</b>\n\nNo communities in this dashboard scope."
+            if await self.is_superadmin(admin_id):
+                text += "\nUse OPS for renter communities."
+                rows.append([InlineKeyboardButton(text="👑 OPS", callback_data="mg:ops")])
             await self.render(
                 admin_id=admin_id,
-                text="<b>🛡 MODGUARD</b>\n\nNo managed groups found yet.",
-                keyboard=InlineKeyboardMarkup(inline_keyboard=[]),
+                text=text,
+                keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
                 selected_chat_id=None,
                 view="dashboard",
             )
             return
 
-        text, keyboard = await self.dashboard_payload(chat_id=chat_id)
+        text, keyboard = await self.dashboard_payload(chat_id=chat_id, admin_id=admin_id)
         await self.render(
             admin_id=admin_id,
             text=text,
@@ -1519,13 +1878,15 @@ class DashboardService:
         if not states:
             return
 
-        text, keyboard = await self.dashboard_payload(chat_id=chat_id)
-
         for state in states:
             if state.dashboard_message_id is None:
                 continue
             if not await self.admin_can_access_chat(state.admin_id, chat_id):
                 continue
+            text, keyboard = await self.dashboard_payload(
+                chat_id=chat_id,
+                admin_id=state.admin_id,
+            )
             try:
                 await self.bot.edit_message_text(
                     chat_id=state.admin_id,

@@ -382,6 +382,38 @@ class ShadowFeedbackRecord(Base):
 
 
 
+class ShadowSimulationEventRecord(Base):
+    """
+    Shadow-only virtual enforcement history.
+
+    These rows simulate what WOULD have happened in LIVE mode so progressive
+    per-user policy ladders can be tested safely. They never become real
+    moderation history and can be reset independently per community.
+    """
+
+    __tablename__ = "shadow_simulation_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id",
+            "telegram_message_id",
+            "target_user_id",
+            "policy_family",
+            name="uq_shadow_sim_event_message_user_family",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    telegram_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    policy_family: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    rule_id: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class ChatRaidSettingsRecord(Base):
     """Per-chat Raid Guard switch. OFF by default."""
 

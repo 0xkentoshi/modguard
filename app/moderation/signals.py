@@ -15,7 +15,7 @@ from app.utils.text_normalization import (
 
 URL_RE = re.compile(
     r"""(?ix)
-    \b(
+    (
         https?://[^\s<>()]+
         |
         www\.[^\s<>()]+
@@ -23,6 +23,14 @@ URL_RE = re.compile(
         t\.me/[^\s<>()]+
         |
         telegram\.me/[^\s<>()]+
+        |
+        (?<![@\w])
+        (?:
+            [a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
+            \s*(?:\.|\[\.\]|\(\.\)|\bdot\b|\bточка\b)\s*
+        )+
+        (?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})
+        (?:/[^\s<>()]*)?
     )
     """
 )
@@ -30,6 +38,30 @@ URL_RE = re.compile(
 MENTION_RE = re.compile(
     r"(?<!\w)@[A-Za-z0-9_]{3,32}"
 )
+
+
+
+
+def normalize_domain_reference(
+    value: str,
+) -> str:
+    """Canonicalize visible/defanged domain notation for LLM context."""
+    normalized = value.strip().casefold()
+    normalized = re.sub(r"\[\.\]|\(\.\)", ".", normalized)
+    normalized = re.sub(r"\s+(?:dot|точка)\s+", ".", normalized, flags=re.I)
+    normalized = re.sub(r"\s*\.\s*", ".", normalized)
+    return normalized
+
+
+def is_obfuscated_domain_reference(
+    value: str,
+) -> bool:
+    lowered = value.casefold()
+    return bool(
+        "[.]" in lowered
+        or "(.)" in lowered
+        or re.search(r"\b(?:dot|точка)\b", lowered, flags=re.I)
+    )
 
 
 def extract_urls(
@@ -174,6 +206,15 @@ def build_behavior_signals(
     urls = extract_urls(
         raw_text
     )
+    domain_references = [
+        normalize_domain_reference(item)
+        for item in urls
+    ]
+    obfuscated_domain_count = sum(
+        1
+        for item in urls
+        if is_obfuscated_domain_reference(item)
+    )
 
     mentions = extract_mentions(
         raw_text
@@ -225,6 +266,9 @@ def build_behavior_signals(
         url_count=len(
             urls
         ),
+        domain_references=domain_references[:8],
+        has_obfuscated_domains=bool(obfuscated_domain_count),
+        obfuscated_domain_count=obfuscated_domain_count,
         mention_count=len(
             mentions
         ),

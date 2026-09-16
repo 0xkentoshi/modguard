@@ -207,6 +207,10 @@ IMPORTANT
 - If the moderator asks to allow banter, the reusable rule should remain
   conditional on reciprocal/playful context and must not ignore a clear request
   to stop, one-sided degradation, threats, or protected safety harms.
+- local_rule describes the semantic situation only. Do NOT encode global counters
+  such as "first occurrence in the community". Escalation tiers are tracked per
+  offending user by deterministic moderation history. If a first-offense concept
+  matters, phrase it as "first confirmed offense by the same user".
 
 ACTION CONSISTENCY
 - corrected_action=allow => current_message_violation=false, category=safe,

@@ -29,11 +29,12 @@ CORE_DEFAULT_ALLOWED_ITEMS = [
 ]
 
 CORE_POLICY_NOTE = (
-    "Protected Core threats cannot be weakened by custom rules. Community-level "
-    "behavior such as ordinary spam, flood, harassment/aggression, advertising, "
-    "and DM solicitation is configurable per chat. A custom policy may relax, "
-    "strengthen, or change those community rules. Shadow and Auto-ban still "
-    "control whether destructive actions are actually executed."
+    "Protected Core categories cannot be disabled or turned into ALLOW. For "
+    "scam/phishing/malicious-link cases a community may tune enforcement down "
+    "to the safe floor MUTE + DELETE; credible direct threats stay BAN + DELETE. "
+    "Community-level spam, flood, harassment/aggression, advertising, and DM "
+    "solicitation remain fully configurable. Shadow and Auto-ban still control "
+    "whether destructive actions are actually executed."
 )
 
 CORE_POLICY_PROMPT = "\n".join(

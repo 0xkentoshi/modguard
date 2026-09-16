@@ -27,6 +27,7 @@ class SemanticObservationJob:
     decision: ModerationDecision
     policy: PolicyEvaluation
     prepared: SemanticPreparedSignal | None = None
+    reset_epoch: int = 0
 
 
 class SemanticClusterService:
@@ -64,6 +65,7 @@ class SemanticClusterService:
         )
         self._worker_task: asyncio.Task | None = None
         self._closing = False
+        self._chat_epochs: dict[int, int] = {}
 
     @property
     def active(self) -> bool:
@@ -198,6 +200,10 @@ class SemanticClusterService:
                     decision=decision,
                     policy=policy,
                     prepared=prepared,
+                    reset_epoch=self._chat_epochs.get(
+                        int(context.current_message.chat_id),
+                        0,
+                    ),
                 )
             )
             return True
@@ -216,6 +222,14 @@ class SemanticClusterService:
             except asyncio.CancelledError:
                 break
             try:
+                chat_id = int(job.context.current_message.chat_id)
+                if job.reset_epoch != self._chat_epochs.get(chat_id, 0):
+                    logger.info(
+                        "SEMANTIC OBSERVE DROP | reason=community_reset | chat=%s | message=%s",
+                        chat_id,
+                        job.context.current_message.telegram_message_id,
+                    )
+                    continue
                 await self.observe_once(
                     context=job.context,
                     decision=job.decision,
@@ -318,6 +332,13 @@ class SemanticClusterService:
             )
 
         return record.cluster_key
+
+    async def invalidate_chat(self, chat_id: int) -> int:
+        """Invalidate queued semantic jobs created before a community reset."""
+        chat_id = int(chat_id)
+        next_epoch = self._chat_epochs.get(chat_id, 0) + 1
+        self._chat_epochs[chat_id] = next_epoch
+        return next_epoch
 
     async def close(self) -> None:
         self._closing = True

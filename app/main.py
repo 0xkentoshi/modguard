@@ -355,32 +355,9 @@ async def main() -> None:
         )
     )
 
-    # Pilot Edition owner-only control plane is optional and intentionally
-    # lives in the git-ignored private_ops package. Public GitHub builds keep
-    # full core moderation functionality when this package is absent.
+    # Public build: standard ADMIN_IDS authorization only.
+    # Commercial platform operations are intentionally not shipped here.
     pilot_access_service = None
-    private_ops_router = None
-    try:
-        from private_ops import PrivateOpsService, router as private_ops_router
-
-        pilot_access_service = PrivateOpsService(
-            bot=bot,
-            control_repository=control_repository,
-            session_factory=database.session_factory,
-            fallback_superadmin_ids=settings.admin_id_list,
-        )
-        logging.info(
-            "Private Pilot Ops ready | superadmins=%s",
-            sorted(pilot_access_service.superadmin_ids),
-        )
-    except ImportError:
-        logging.info("Private Pilot Ops not installed; public admin mode active")
-    except Exception:
-        logging.exception(
-            "Private Pilot Ops failed to initialize; fail-safe public mode active"
-        )
-        pilot_access_service = None
-        private_ops_router = None
 
     fake_admin_detector = FakeAdminDetector(
         bot=bot,
@@ -391,7 +368,7 @@ async def main() -> None:
         repository=control_repository,
         semantic_service=semantic_cluster_service,
         bot=bot,
-        admin_ids=settings.admin_id_list,
+        admin_ids=platform_admin_ids,
         similarity_threshold=0.92,
         window_seconds=90,
         min_messages=4,
@@ -401,9 +378,7 @@ async def main() -> None:
 
     notifier = AdminNotifier(
         bot=bot,
-        admin_ids=(
-            settings.admin_id_list
-        ),
+        admin_ids=platform_admin_ids,
         recipient_provider=pilot_access_service,
     )
 
@@ -412,9 +387,7 @@ async def main() -> None:
         repository=(
             control_repository
         ),
-        admin_ids=(
-            settings.admin_id_list
-        ),
+        admin_ids=platform_admin_ids,
         global_dry_run=(
             settings.dry_run
         ),
@@ -448,6 +421,21 @@ async def main() -> None:
         max_execution_failures=settings.safety_max_execution_failures,
         max_pipeline_failures=settings.safety_max_pipeline_failures,
     )
+
+    if pilot_access_service is not None:
+        configure_reset_hooks = getattr(
+            pilot_access_service,
+            "configure_runtime_hooks",
+            None,
+        )
+        if callable(configure_reset_hooks):
+            configure_reset_hooks(
+                decision_cache=decision_cache,
+                alert_throttle=alert_throttle,
+                safety_circuit=safety_circuit,
+                semantic_cluster_service=semantic_cluster_service,
+                dashboard_service=dashboard_service,
+            )
 
     moderation_executor = (
         ModerationExecutor(
@@ -498,11 +486,6 @@ async def main() -> None:
     chat_locks = ChatLockManager()
 
     dispatcher = Dispatcher()
-
-    if private_ops_router is not None:
-        dispatcher.include_router(
-            private_ops_router
-        )
 
     dispatcher.include_router(
         admin_router

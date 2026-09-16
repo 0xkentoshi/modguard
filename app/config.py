@@ -7,7 +7,6 @@ from pydantic_settings import (
 class Settings(BaseSettings):
     telegram_bot_token: str
     admin_ids: str = ""
-
     llm_provider: str = "ollama"
     ollama_base_url: str = (
         "http://localhost:11434"
@@ -67,9 +66,8 @@ class Settings(BaseSettings):
     autonomous_delete_threshold: float = 0.78
     autonomous_warn_threshold: float = 0.70
 
-    # Pilot safety circuit: fail closed to per-chat SHADOW on abnormal bursts
-    # or repeated pipeline/action failures. Tunable through .env, intentionally
-    # not exposed as everyday renter UI controls.
+    # Safety circuit: fail closed to per-chat SHADOW on abnormal bursts
+    # or repeated pipeline/action failures. Tunable through .env.
     safety_circuit_enabled: bool = True
     safety_action_window_seconds: int = 60
     safety_max_destructive_actions: int = 20

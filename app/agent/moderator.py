@@ -224,6 +224,55 @@ class ModeratorAgent:
         )
 
 
+    def _normalize_report_intent(
+        self,
+        result: ReportIntentDecision,
+        *,
+        source: str,
+    ) -> ReportIntentDecision:
+        """Keep report routing conservative for mixed hostile replies.
+
+        A reply that independently violates policy is only allowed to open a
+        second report-review branch when the semantic classifier also found an
+        explicit moderation request. This prevents ordinary threats/insults
+        from re-reviewing the innocent message they replied to.
+        """
+        if (
+            result.report_target
+            and result.reporter_has_independent_violation
+            and result.explicit_moderation_request is False
+        ):
+            logger.info(
+                "REPORT PREFLIGHT MIXED REJECT | source=%s | "
+                "reason=no_explicit_moderation_request | confidence=%.2f",
+                source,
+                result.confidence,
+            )
+            return result.model_copy(
+                update={
+                    "report_target": False,
+                    "reason": (
+                        "Independent violation without an explicit "
+                        "moderation request."
+                    ),
+                }
+            )
+
+        if (
+            result.report_target
+            and result.reporter_has_independent_violation
+            and result.explicit_moderation_request is None
+        ):
+            logger.info(
+                "REPORT PREFLIGHT LEGACY COMPAT | source=%s | "
+                "report=true | independent_violation=true | "
+                "explicit_request=missing | confidence=%.2f",
+                source,
+                result.confidence,
+            )
+
+        return result
+
     async def classify_reply_intent(
         self,
         context: MessageContext,
@@ -241,6 +290,7 @@ class ModeratorAgent:
                 report_target=False,
                 confidence=1.0,
                 reporter_has_independent_violation=False,
+                explicit_moderation_request=False,
                 reason="No reply target.",
             )
 
@@ -260,6 +310,14 @@ class ModeratorAgent:
                 ),
                 response_model=ReportIntentDecision,
             )
+            result = self._normalize_report_intent(
+                result,
+                source=(
+                    "fast"
+                    if provider is self.fast_provider
+                    else "deep"
+                ),
+            )
 
             elapsed_ms = int(
                 (time.perf_counter() - started)
@@ -268,7 +326,8 @@ class ModeratorAgent:
 
             logger.info(
                 "REPORT PREFLIGHT | model=%s | ms=%s | "
-                "report=%s | independent_violation=%s | confidence=%.2f",
+                "report=%s | independent_violation=%s | "
+                "explicit_request=%s | confidence=%.2f",
                 (
                     "fast"
                     if provider is self.fast_provider
@@ -277,16 +336,19 @@ class ModeratorAgent:
                 elapsed_ms,
                 result.report_target,
                 result.reporter_has_independent_violation,
+                result.explicit_moderation_request,
                 result.confidence,
             )
 
-            # If the small model is unsure that this is an ordinary reply,
-            # ask Deep AI before exposing the reply to ordinary moderation.
+            # If the small model is not virtually certain that this is an
+            # ordinary reply, ask Deep AI before exposing the reply to ordinary
+            # moderation. 0.99 used to be too permissive: short explicit report
+            # phrases such as "admins check this" could be misrouted as abuse.
             if (
                 self.fast_provider is not None
                 and provider is self.fast_provider
                 and not result.report_target
-                and result.confidence < 0.99
+                and result.confidence < 0.995
             ):
                 deep_started = time.perf_counter()
 
@@ -297,6 +359,10 @@ class ModeratorAgent:
                     ),
                     response_model=ReportIntentDecision,
                 )
+                deep_result = self._normalize_report_intent(
+                    deep_result,
+                    source="deep",
+                )
 
                 deep_ms = int(
                     (time.perf_counter() - deep_started)
@@ -305,10 +371,12 @@ class ModeratorAgent:
 
                 logger.info(
                     "REPORT PREFLIGHT DEEP | ms=%s | "
-                    "report=%s | independent_violation=%s | confidence=%.2f",
+                    "report=%s | independent_violation=%s | "
+                    "explicit_request=%s | confidence=%.2f",
                     deep_ms,
                     deep_result.report_target,
                     deep_result.reporter_has_independent_violation,
+                    deep_result.explicit_moderation_request,
                     deep_result.confidence,
                 )
 
@@ -327,6 +395,7 @@ class ModeratorAgent:
                 report_target=False,
                 confidence=0.0,
                 reporter_has_independent_violation=False,
+                explicit_moderation_request=False,
                 reason="Report intent classifier unavailable.",
             )
 
