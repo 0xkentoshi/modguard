@@ -76,3 +76,22 @@ class AdminAlertThrottle:
             self._last_sent[key] = now
 
             return True, suppressed
+
+    async def invalidate_chat(self, chat_id: int) -> int:
+        """Forget alert cooldown/suppression state for one community."""
+        chat_id = int(chat_id)
+        prefixes = (
+            f"shadow:{chat_id}:",
+            f"user-warning:{chat_id}:",
+            f"{chat_id}:",
+        )
+        async with self._lock:
+            keys = {
+                key
+                for key in set(self._last_sent) | set(self._suppressed)
+                if key.startswith(prefixes)
+            }
+            for key in keys:
+                self._last_sent.pop(key, None)
+                self._suppressed.pop(key, None)
+            return len(keys)

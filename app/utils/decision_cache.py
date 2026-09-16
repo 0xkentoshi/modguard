@@ -95,3 +95,18 @@ class AsyncDecisionCache(Generic[ValueT]):
                 )
 
         return value, False
+
+    async def invalidate_prefix(self, prefix: str) -> int:
+        """Drop cached decisions for one scoped key prefix.
+
+        ModGuard cache keys start with ``<chat_id>:`` so owner-level community
+        reset can invalidate one community without disturbing every other chat.
+        In-flight tasks are not cancelled; the community reset barrier waits for
+        active moderation pipelines before calling this method.
+        """
+        prefix = str(prefix)
+        async with self._lock:
+            keys = [key for key in self._values if key.startswith(prefix)]
+            for key in keys:
+                self._values.pop(key, None)
+            return len(keys)

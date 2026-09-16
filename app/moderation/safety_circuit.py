@@ -82,6 +82,13 @@ class SafetyCircuitBreaker:
             self._states[chat_id] = state
         return state
 
+    def reset_chat_state(self, chat_id: int) -> bool:
+        """Clear only transient circuit counters for one community.
+
+        Persistent SHADOW/other community settings are deliberately untouched.
+        """
+        return self._states.pop(int(chat_id), None) is not None
+
     @staticmethod
     def _prune(queue: deque[float], *, now: float, window: int) -> None:
         cutoff = now - window

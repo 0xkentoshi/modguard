@@ -103,6 +103,15 @@ def build_triage_prompt(
             "url_count": (
                 context.behavior_signals.url_count
             ),
+            "domain_references": (
+                context.behavior_signals.domain_references
+            ),
+            "has_obfuscated_domains": (
+                context.behavior_signals.has_obfuscated_domains
+            ),
+            "obfuscated_domain_count": (
+                context.behavior_signals.obfuscated_domain_count
+            ),
             "messages_last_60s": (
                 context.behavior_signals.messages_last_60s
             ),

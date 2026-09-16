@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.admin.control_models import (
@@ -27,6 +27,7 @@ from app.admin.control_models import (
     RaidIncidentRecord,
     SemanticObservationRecord,
     ShadowFeedbackRecord,
+    ShadowSimulationEventRecord,
     TestArtifactRecord,
 )
 from app.database.models import MessageRecord, ModerationEventRecord
@@ -112,19 +113,32 @@ class ControlRepository:
 
         async with self.session_factory() as session:
             async with session.begin():
-                alias = await session.get(ChatMigrationRecord, old_chat_id)
-                if alias is None:
-                    alias = ChatMigrationRecord(
+                # Telegram emits migrate_to and migrate_from service updates very
+                # close together. Two handlers may therefore register the same
+                # alias concurrently. Use an idempotent SQLite insert followed by
+                # an update instead of SELECT-then-INSERT, which races on the PK.
+                await session.execute(
+                    insert(ChatMigrationRecord)
+                    .values(
                         old_chat_id=old_chat_id,
                         new_chat_id=new_chat_id,
                         chat_title=chat_title,
+                        created_at=utcnow(),
+                        updated_at=utcnow(),
                     )
-                    session.add(alias)
-                else:
-                    alias.new_chat_id = new_chat_id
-                    if chat_title:
-                        alias.chat_title = chat_title
-                    alias.updated_at = utcnow()
+                    .prefix_with("OR IGNORE")
+                )
+                values = {
+                    "new_chat_id": new_chat_id,
+                    "updated_at": utcnow(),
+                }
+                if chat_title:
+                    values["chat_title"] = chat_title
+                await session.execute(
+                    update(ChatMigrationRecord)
+                    .where(ChatMigrationRecord.old_chat_id == old_chat_id)
+                    .values(**values)
+                )
 
                 # A confirmed migration proves that the canonical target exists.
                 await session.execute(
@@ -259,6 +273,32 @@ class ControlRepository:
                     .where(AdminAlertArtifactRecord.managed_chat_id == old_chat_id)
                     .values(managed_chat_id=new_chat_id)
                 )
+
+                # Shadow simulation is ephemeral but should follow a Telegram
+                # group -> supergroup migration. Merge idempotently because
+                # message ids may overlap across the two chat-id namespaces.
+                shadow_sim_result = await session.execute(
+                    select(ShadowSimulationEventRecord).where(
+                        ShadowSimulationEventRecord.chat_id == old_chat_id
+                    )
+                )
+                for shadow_event in list(shadow_sim_result.scalars().all()):
+                    await session.execute(
+                        insert(ShadowSimulationEventRecord)
+                        .values(
+                            chat_id=new_chat_id,
+                            telegram_message_id=shadow_event.telegram_message_id,
+                            target_user_id=shadow_event.target_user_id,
+                            policy_family=shadow_event.policy_family,
+                            rule_id=shadow_event.rule_id,
+                            policy_version=shadow_event.policy_version,
+                            action=shadow_event.action,
+                            category=shadow_event.category,
+                            created_at=shadow_event.created_at,
+                        )
+                        .prefix_with("OR IGNORE")
+                    )
+                    await session.delete(shadow_event)
 
                 # Keep exactly one active policy after merging two chat ids and
                 # make version ordering deterministic again.
@@ -867,6 +907,48 @@ class ControlRepository:
 
             return version
 
+    async def activate_community_policy_version(
+        self,
+        *,
+        chat_id: int,
+        admin_id: int,
+        source_text: str,
+        rules_json: str,
+        summary: str,
+    ) -> CommunityPolicyVersionRecord:
+        """Atomically activate a new immutable policy version."""
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                max_result = await session.execute(
+                    select(func.max(CommunityPolicyVersionRecord.version))
+                    .where(CommunityPolicyVersionRecord.chat_id == chat_id)
+                )
+                next_version = int(max_result.scalar_one() or 0) + 1
+
+                active_result = await session.execute(
+                    select(CommunityPolicyVersionRecord)
+                    .where(
+                        CommunityPolicyVersionRecord.chat_id == chat_id,
+                        CommunityPolicyVersionRecord.active.is_(True),
+                    )
+                )
+                for current in active_result.scalars().all():
+                    current.active = False
+
+                version = CommunityPolicyVersionRecord(
+                    chat_id=chat_id,
+                    version=next_version,
+                    source_text=source_text,
+                    rules_json=rules_json,
+                    summary=summary,
+                    created_by_admin_id=admin_id,
+                    active=True,
+                )
+                session.add(version)
+
+            return version
+
     async def rollback_community_policy(
         self,
         *,
@@ -1234,6 +1316,58 @@ class ControlRepository:
         async with self.session_factory() as session:
             return await session.get(ModerationTicketRecord, ticket_id)
 
+    async def claim_ticket_resolution(
+        self,
+        *,
+        ticket_id: int,
+        action: str,
+    ) -> bool:
+        """Atomically claim an open real ticket before Telegram side effects.
+
+        Multiple renter/platform mirror cards may point to one ticket. Only one
+        callback is allowed to move OPEN -> PROCESSING; later callbacks become
+        read-only instead of applying a second punishment.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(
+                    update(ModerationTicketRecord)
+                    .where(
+                        ModerationTicketRecord.id == int(ticket_id),
+                        ModerationTicketRecord.status == "open",
+                    )
+                    .values(
+                        status="processing",
+                        resolution_action=str(action),
+                        updated_at=utcnow(),
+                    )
+                )
+                return bool(result.rowcount == 1)
+
+    async def release_ticket_resolution_claim(
+        self,
+        *,
+        ticket_id: int,
+        action: str,
+    ) -> bool:
+        """Return PROCESSING -> OPEN only when Telegram action did not run."""
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(
+                    update(ModerationTicketRecord)
+                    .where(
+                        ModerationTicketRecord.id == int(ticket_id),
+                        ModerationTicketRecord.status == "processing",
+                        ModerationTicketRecord.resolution_action == str(action),
+                    )
+                    .values(
+                        status="open",
+                        resolution_action=None,
+                        updated_at=utcnow(),
+                    )
+                )
+                return bool(result.rowcount == 1)
+
     async def resolve_ticket(self, *, ticket_id: int, action: str) -> bool:
         async with self.session_factory() as session:
             async with session.begin():
@@ -1440,6 +1574,116 @@ class ControlRepository:
                 result.scalar_one()
                 or 0
             )
+
+    async def record_shadow_simulation_event(
+        self,
+        *,
+        chat_id: int,
+        telegram_message_id: int,
+        target_user_id: int,
+        policy_family: str,
+        action: str,
+        category: str | None = None,
+        rule_id: str | None = None,
+        policy_version: int | None = None,
+    ) -> bool:
+        """Record one virtual Shadow enforcement outcome idempotently.
+
+        This history is intentionally isolated from real moderation_events. It
+        exists only so SHADOW can simulate per-user ladders such as
+        MUTE+DELETE -> BAN+DELETE without punishing the user for real.
+        """
+        chat_id = await self.resolve_chat_id(int(chat_id))
+        family = (policy_family or "other").strip().casefold()[:64] or "other"
+        action = (action or "allow").strip().casefold()[:32]
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(
+                    insert(ShadowSimulationEventRecord)
+                    .values(
+                        chat_id=chat_id,
+                        telegram_message_id=int(telegram_message_id),
+                        target_user_id=int(target_user_id),
+                        policy_family=family,
+                        rule_id=(rule_id or None),
+                        policy_version=policy_version,
+                        action=action,
+                        category=(category or None),
+                        created_at=utcnow(),
+                    )
+                    .prefix_with("OR IGNORE")
+                )
+                # SQLite reports 1 for an inserted row and 0 for OR IGNORE.
+                return getattr(result, "rowcount", 0) == 1
+
+    async def get_shadow_simulation_actions(
+        self,
+        *,
+        chat_id: int,
+        target_user_id: int,
+        policy_family: str,
+        limit: int = 20,
+        exclude_telegram_message_id: int | None = None,
+    ) -> list[str]:
+        """Return prior Shadow ladder actions for one user + policy family.
+
+        A report re-review may run the same Telegram message through policy
+        again.  That must not turn one unique offense into two ladder strikes.
+        When ``exclude_telegram_message_id`` is supplied, the already-recorded
+        outcome for that exact message is ignored while selecting the tier.
+        The unique constraint on ``shadow_simulation_events`` still guarantees
+        that the message can be recorded only once.
+        """
+        chat_id = await self.resolve_chat_id(int(chat_id))
+        family = (policy_family or "other").strip().casefold()[:64] or "other"
+        async with self.session_factory() as session:
+            statement = select(ShadowSimulationEventRecord.action).where(
+                ShadowSimulationEventRecord.chat_id == chat_id,
+                ShadowSimulationEventRecord.target_user_id == int(target_user_id),
+                ShadowSimulationEventRecord.policy_family == family,
+            )
+            if exclude_telegram_message_id is not None:
+                statement = statement.where(
+                    ShadowSimulationEventRecord.telegram_message_id
+                    != int(exclude_telegram_message_id)
+                )
+            result = await session.execute(
+                statement
+                .order_by(
+                    ShadowSimulationEventRecord.created_at.desc(),
+                    ShadowSimulationEventRecord.id.desc(),
+                )
+                .limit(max(1, int(limit)))
+            )
+            return [str(value) for value in result.scalars().all()]
+
+    async def count_shadow_simulation_events(self, *, chat_id: int) -> int:
+        chat_id = await self.resolve_chat_id(int(chat_id))
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(func.count(ShadowSimulationEventRecord.id)).where(
+                    ShadowSimulationEventRecord.chat_id == chat_id
+                )
+            )
+            return int(result.scalar_one() or 0)
+
+    async def reset_shadow_simulation(self, *, chat_id: int) -> int:
+        """Clear only virtual Shadow escalation state for one community."""
+        chat_id = await self.resolve_chat_id(int(chat_id))
+        async with self.session_factory() as session:
+            async with session.begin():
+                count_result = await session.execute(
+                    select(func.count(ShadowSimulationEventRecord.id)).where(
+                        ShadowSimulationEventRecord.chat_id == chat_id
+                    )
+                )
+                count = int(count_result.scalar_one() or 0)
+                await session.execute(
+                    delete(ShadowSimulationEventRecord).where(
+                        ShadowSimulationEventRecord.chat_id == chat_id
+                    )
+                )
+            return count
 
     async def create_shadow_feedback_case(
         self,
@@ -1759,6 +2003,13 @@ class ControlRepository:
                 .where(
                     ShadowFeedbackRecord.chat_id == chat_id,
                     ShadowFeedbackRecord.status == "confirmed",
+                    or_(
+                        # One-click agreements stay soft positive calibration.
+                        ShadowFeedbackRecord.moderator_explanation == "",
+                        # Pair-specific relationship feedback cannot be encoded
+                        # safely as a chat-wide Community Policy rule.
+                        ShadowFeedbackRecord.apply_to_same_pair.is_(True),
+                    ),
                 )
                 .order_by(
                     ShadowFeedbackRecord.resolved_at.desc(),
@@ -1768,12 +2019,33 @@ class ControlRepository:
             )
             return list(result.scalars().all())
 
+    async def revoke_confirmed_shadow_feedback(
+        self,
+        *,
+        chat_id: int,
+    ) -> int:
+        """Disable learned Shadow feedback without deleting its audit trail."""
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(ShadowFeedbackRecord).where(
+                        ShadowFeedbackRecord.chat_id == chat_id,
+                        ShadowFeedbackRecord.status == "confirmed",
+                    )
+                )
+                rows = list(result.scalars().all())
+                for item in rows:
+                    item.status = "revoked"
+                    item.updated_at = utcnow()
+                return len(rows)
+
     async def shadow_feedback_stats(
         self,
         *,
         chat_id: int,
     ) -> dict[str, int]:
-        """Small calibration metric set for dashboard/debugging and future UI."""
+        """Small pilot metric set for ops/debugging and future UI."""
 
         async with self.session_factory() as session:
             result = await session.execute(
@@ -2132,6 +2404,7 @@ class ControlRepository:
         *,
         managed_chat_id: int,
         kind: str | None = None,
+        kind_prefix: str | None = None,
     ) -> list[AdminAlertArtifactRecord]:
         async with self.session_factory() as session:
             statement = select(AdminAlertArtifactRecord).where(
@@ -2139,6 +2412,10 @@ class ControlRepository:
             )
             if kind is not None:
                 statement = statement.where(AdminAlertArtifactRecord.kind == kind)
+            if kind_prefix is not None:
+                statement = statement.where(
+                    AdminAlertArtifactRecord.kind.like(f"{kind_prefix}%")
+                )
             result = await session.execute(statement.order_by(AdminAlertArtifactRecord.id.asc()))
             return list(result.scalars().all())
 
@@ -2147,6 +2424,7 @@ class ControlRepository:
         *,
         managed_chat_id: int,
         kind: str | None = None,
+        kind_prefix: str | None = None,
     ) -> int:
         async with self.session_factory() as session:
             async with session.begin():
@@ -2159,6 +2437,13 @@ class ControlRepository:
                 if kind is not None:
                     count_stmt = count_stmt.where(AdminAlertArtifactRecord.kind == kind)
                     delete_stmt = delete_stmt.where(AdminAlertArtifactRecord.kind == kind)
+                if kind_prefix is not None:
+                    count_stmt = count_stmt.where(
+                        AdminAlertArtifactRecord.kind.like(f"{kind_prefix}%")
+                    )
+                    delete_stmt = delete_stmt.where(
+                        AdminAlertArtifactRecord.kind.like(f"{kind_prefix}%")
+                    )
                 count = int((await session.execute(count_stmt)).scalar_one() or 0)
                 await session.execute(delete_stmt)
                 return count

@@ -164,6 +164,23 @@ class ModerationExecutor:
         """Telegram does not allow bots to restrict/ban chat owners/admins."""
         if self.bot is None:
             return False, "Telegram Bot instance is unavailable"
+
+        get_chat = getattr(self.bot, "get_chat", None)
+        if callable(get_chat):
+            try:
+                tg_chat = await get_chat(chat_id)
+                raw_type = getattr(tg_chat, "type", "")
+                chat_type = str(getattr(raw_type, "value", raw_type)).casefold()
+                if chat_type and chat_type != "supergroup":
+                    return False, "LIVE_RESTRICT_UNSUPPORTED: Telegram mute/restrict requires a supergroup"
+            except TelegramAPIError as exc:
+                logger.warning(
+                    "Restriction chat-type precheck failed | chat=%s | user=%s | %s",
+                    chat_id,
+                    user_id,
+                    exc,
+                )
+
         # Real aiogram Bot always exposes get_chat_member. Some lightweight
         # test doubles and alternative Bot-compatible adapters do not. In that
         # compatibility case we cannot preflight the role, so let Telegram (or
@@ -209,6 +226,34 @@ class ModerationExecutor:
             )
             return True, None
 
+    async def _force_shadow_for_capability_failure(
+        self,
+        *,
+        chat_id: int,
+        reason: str | None,
+    ) -> None:
+        message = str(reason or "")
+        lowered = message.casefold()
+        capability_failure = (
+            "live_restrict_unsupported" in lowered
+            or "method is available only in supergroups" in lowered
+            or "restrict members permission" in lowered
+        )
+        if not capability_failure or self.control_repository is None:
+            return
+        try:
+            await self.control_repository.set_shadow(chat_id, True)
+            logger.critical(
+                "LIVE CAPABILITY BLOCK | chat=%s | SHADOW FORCED | reason=%s",
+                chat_id,
+                message,
+            )
+        except Exception:
+            logger.exception(
+                "Could not force SHADOW after Telegram capability failure | chat=%s",
+                chat_id,
+            )
+
     async def _mute_user(
         self, *, chat_id: int, user_id: int, minutes: int
     ) -> tuple[bool, str | None]:
@@ -221,6 +266,9 @@ class ModerationExecutor:
             logger.info(
                 "LIVE MUTE SKIPPED | chat=%s | user=%s | reason=%s",
                 chat_id, user_id, guard_reason,
+            )
+            await self._force_shadow_for_capability_failure(
+                chat_id=chat_id, reason=guard_reason
             )
             return False, guard_reason
         try:
@@ -242,6 +290,9 @@ class ModerationExecutor:
                 logger.info("LIVE MUTE SKIPPED | chat=%s | user=%s | reason=%s", chat_id, user_id, message)
             else:
                 logger.exception("LIVE MUTE FAILED | chat=%s | user=%s", chat_id, user_id)
+            await self._force_shadow_for_capability_failure(
+                chat_id=chat_id, reason=message
+            )
             return False, message
         except Exception as exc:
             logger.exception("Unexpected LIVE MUTE failure | chat=%s | user=%s", chat_id, user_id)
@@ -264,6 +315,9 @@ class ModerationExecutor:
                 "LIVE BAN SKIPPED | chat=%s | user=%s | reason=%s",
                 chat_id, user_id, guard_reason,
             )
+            await self._force_shadow_for_capability_failure(
+                chat_id=chat_id, reason=guard_reason
+            )
             return False, guard_reason
 
         try:
@@ -283,6 +337,9 @@ class ModerationExecutor:
                     chat_id,
                     user_id,
                 )
+            await self._force_shadow_for_capability_failure(
+                chat_id=chat_id, reason=message
+            )
             return False, message
 
         except Exception as exc:
@@ -300,6 +357,8 @@ class ModerationExecutor:
         decision: ModerationDecision,
         policy: PolicyEvaluation,
         live_ban_enabled: bool,
+        core_decision: ModerationDecision | None = None,
+        core_policy: PolicyEvaluation | None = None,
     ) -> bool:
         if (
             self.dashboard_service is None
@@ -308,6 +367,12 @@ class ModerationExecutor:
             return False
 
         current = context.current_message
+
+        def recommendation_label(value: PolicyEvaluation) -> str:
+            name = get_action_name(value.final_action).upper()
+            if value.final_action in {"mute", "ban"} and value.final_delete_message:
+                return f"{name} + DELETE"
+            return name
 
         if policy.final_action == "ban":
             if live_ban_enabled:
@@ -327,6 +392,14 @@ class ModerationExecutor:
             else:
                 action = "BAN BLOCKED · Auto-ban OFF"
 
+        elif policy.final_action == "mute":
+            if policy.final_delete_message and self.live_delete_enabled:
+                action = "MUTE + DELETE"
+            elif policy.final_delete_message:
+                action = "MUTE · DELETE BLOCKED · Live cleanup OFF"
+            else:
+                action = "MUTE"
+
         elif policy.final_action == "delete":
             action = (
                 "DELETE"
@@ -334,7 +407,7 @@ class ModerationExecutor:
                 else "DELETE BLOCKED · Live cleanup OFF"
             )
         else:
-            action = get_action_name(policy.final_action)
+            action = get_action_name(policy.final_action).upper()
 
         alert_key = (
             f"shadow:{current.chat_id}:"
@@ -390,12 +463,37 @@ class ModerationExecutor:
                 f"{relationship.total_pair_replies} observed mutual replies"
             )
 
+        core_decision = core_decision or decision
+        core_policy = core_policy or policy
+        core_action = recommendation_label(core_policy)
+        policy_action = recommendation_label(policy)
+
+        try:
+            community_title = await self.dashboard_service._chat_title(
+                current.chat_id
+            )
+        except Exception:
+            logger.debug(
+                "Could not resolve Shadow community title | chat=%s",
+                current.chat_id,
+                exc_info=True,
+            )
+            community_title = f"chat {current.chat_id}"
+
         text = (
             f"🛡 <b>SHADOW · WOULD {html.escape(action)}</b>\n"
+            f"🏘 <b>Community:</b> {html.escape(str(community_title))}\n"
             f"{html.escape(who)} · {html.escape(policy_label)} · "
             f"{decision.confidence:.0%}\n\n"
             f"<code>{html.escape(snippet)}</code>\n\n"
-            f"<b>Why:</b> {html.escape(decision.reason[:500])}"
+            f"<b>AI/Core recommendation:</b> {html.escape(core_action)}\n"
+            + (
+                f"<b>Community policy result:</b> {html.escape(policy_action)}\n"
+                if policy.source == "community_policy"
+                else ""
+            )
+            + f"<b>With current safety settings:</b> {html.escape(action)}\n"
+            + f"<b>Why:</b> {html.escape(decision.reason[:500])}"
             f"{relationship_line}"
         )
 
@@ -438,8 +536,15 @@ class ModerationExecutor:
                                 else None
                             ),
                             "relationship_signals": relationship.model_dump(),
+                            "behavior_signals": context.behavior_signals.model_dump(),
+                            "text_signals": context.text_signals.model_dump(),
+                            "chat_title": str(community_title),
                             "policy_source": policy.source,
                             "matched_community_rules": policy.matched_community_rules,
+                            "core_recommendation": core_action,
+                            "community_policy_result": policy_action,
+                            "effective_shadow_action": action,
+                            "live_ban_enabled": live_ban_enabled,
                         },
                         ai_action=policy.final_action,
                         ai_category=decision.category,
@@ -473,7 +578,7 @@ class ModerationExecutor:
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    text="🧹 Clear shadow alerts",
+                    text="🧹 Clear this community alerts",
                     callback_data=f"mg:shadow_clear:{current.chat_id}",
                 )
             ]
@@ -482,7 +587,6 @@ class ModerationExecutor:
             inline_keyboard=keyboard_rows
         )
 
-        recipients = set(self.dashboard_service.admin_ids)
         access_service = getattr(
             self.dashboard_service,
             "access_service",
@@ -490,17 +594,26 @@ class ModerationExecutor:
         )
         if access_service is not None:
             try:
-                recipients.update(
-                    int(item)
-                    for item in await access_service.notification_recipients(
+                recipient_reader = getattr(
+                    access_service,
+                    "moderation_recipients",
+                    None,
+                )
+                if callable(recipient_reader):
+                    resolved_recipients = await recipient_reader(current.chat_id)
+                else:
+                    resolved_recipients = await access_service.notification_recipients(
                         current.chat_id
                     )
-                )
+                recipients = {int(item) for item in resolved_recipients}
             except Exception:
                 logger.exception(
                     "Could not resolve Shadow feedback recipients | chat=%s",
                     current.chat_id,
                 )
+                recipients = set(self.dashboard_service.admin_ids)
+        else:
+            recipients = set(self.dashboard_service.admin_ids)
 
         sent = False
         for admin_id in sorted(recipients):
@@ -517,7 +630,11 @@ class ModerationExecutor:
                         managed_chat_id=current.chat_id,
                         admin_chat_id=admin_id,
                         telegram_message_id=message.message_id,
-                        kind="shadow_alert",
+                        kind=(
+                            f"shadow_alert:{shadow_case.id}"
+                            if shadow_case is not None
+                            else "shadow_alert"
+                        ),
                     )
             except TelegramAPIError:
                 logger.warning(
@@ -723,70 +840,60 @@ class ModerationExecutor:
         self,
         ticket,
     ) -> None:
+        """Send a real review card as a separate DM message.
+
+        v1.5 deliberately keeps review work out of the persistent dashboard.
+        The card is removed after a successful resolution by the admin handler.
+        """
         if (
             not self.notify_new_tickets
-            or self.dashboard_service
-            is None
+            or self.dashboard_service is None
         ):
             return
 
         if ticket.occurrence_count != 1:
             return
 
-        who = (
-            ticket.username
-            or (
-                f"user {ticket.target_user_id}"
-                if ticket.target_user_id
-                is not None
-                else "unknown"
-            )
-        )
-
-        confidence = (
-            f"{ticket.confidence:.0%}"
-            if ticket.confidence
-            is not None
-            else "—"
-        )
-
-        text = (
-            "⚠️ <b>Review needed</b>\n"
-            f"{who} · "
-            f"{ticket.category} · "
-            f"{confidence}"
-        )
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Open ticket",
-                        callback_data=(
-                            f"mg:ticket:{ticket.id}"
-                        ),
-                    )
-                ]
-            ]
-        )
-
-        for admin_id in (
-            self.dashboard_service
-            .admin_ids
-        ):
+        access_service = getattr(self.dashboard_service, "access_service", None)
+        if access_service is not None:
             try:
-                await self.dashboard_service.bot.send_message(
-                    chat_id=admin_id,
-                    text=text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
+                recipient_reader = getattr(
+                    access_service,
+                    "moderation_recipients",
+                    None,
                 )
+                if callable(recipient_reader):
+                    resolved_recipients = await recipient_reader(int(ticket.chat_id))
+                else:
+                    resolved_recipients = await access_service.notification_recipients(
+                        int(ticket.chat_id)
+                    )
+                recipients = {int(item) for item in resolved_recipients}
+            except Exception:
+                logger.exception(
+                    "Could not resolve review recipients | chat=%s",
+                    ticket.chat_id,
+                )
+                recipients = set(self.dashboard_service.admin_ids)
+        else:
+            recipients = set(self.dashboard_service.admin_ids)
 
+        for admin_id in sorted(recipients):
+            try:
+                await self.dashboard_service.send_ticket_message(
+                    admin_id=admin_id,
+                    ticket_id=int(ticket.id),
+                )
             except TelegramAPIError:
                 logger.warning(
-                    "Could not send compact "
-                    "ticket notification.",
+                    "Could not send review card.",
                     exc_info=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not build/send review card | admin=%s | ticket=%s",
+                    admin_id,
+                    ticket.id,
                 )
 
     async def _create_ticket(
@@ -1006,14 +1113,82 @@ class ModerationExecutor:
 
         return event
 
+    async def _record_shadow_policy_simulation(
+        self,
+        *,
+        context: MessageContext,
+        decision: ModerationDecision,
+        policy: PolicyEvaluation,
+        shadow_mode: bool,
+    ) -> None:
+        """Persist the virtual policy outcome before alert throttling.
+
+        Every processed Shadow offense counts, even when a duplicate admin
+        alert is suppressed. This state never enters real moderation history.
+        """
+        current = context.current_message
+        if (
+            not shadow_mode
+            or self.control_repository is None
+            or policy.source != "community_policy"
+            or policy.final_action not in {"warn", "delete", "mute", "ban"}
+            or current.user_id is None
+            or current.telegram_message_id is None
+            or not policy.community_policy_family
+            or policy.community_policy_family == "other"
+        ):
+            return
+
+        recorder = getattr(
+            self.control_repository, "record_shadow_simulation_event", None
+        )
+        if not callable(recorder):
+            return
+
+        try:
+            inserted = await recorder(
+                chat_id=current.chat_id,
+                telegram_message_id=current.telegram_message_id,
+                target_user_id=current.user_id,
+                policy_family=policy.community_policy_family,
+                action=policy.final_action,
+                category=decision.category,
+                rule_id=(
+                    policy.matched_community_rules[0]
+                    if policy.matched_community_rules
+                    else None
+                ),
+                policy_version=policy.community_policy_version,
+            )
+            if inserted:
+                logger.info(
+                    "SHADOW SIMULATION RECORDED | chat=%s | user=%s | family=%s | action=%s | message=%s",
+                    current.chat_id,
+                    current.user_id,
+                    policy.community_policy_family,
+                    policy.final_action,
+                    current.telegram_message_id,
+                )
+        except Exception:
+            # Simulation must never destabilize moderation.
+            logger.exception(
+                "Shadow simulation recording failed | chat=%s | user=%s",
+                current.chat_id,
+                current.user_id,
+            )
+
     async def execute(
         self,
         *,
         context: MessageContext,
         decision: ModerationDecision,
         policy: PolicyEvaluation,
+        core_decision: ModerationDecision | None = None,
+        core_policy: PolicyEvaluation | None = None,
     ) -> ExecutionResult:
         current = context.current_message
+        core_decision = core_decision or decision
+        core_policy = core_policy or policy
 
         shadow_mode = await self._shadow_mode(
             context
@@ -1346,12 +1521,24 @@ class ModerationExecutor:
                 "matched_community_rules": (
                     policy.matched_community_rules
                 ),
+                "community_policy_family": (
+                    policy.community_policy_family
+                ),
                 "current_message_evidence": (
                     decision.current_message_evidence
                 ),
                 "context_evidence": decision.context_evidence,
                 "report_target": decision.report_target,
             },
+        )
+
+        # Record virtual SHADOW enforcement before notification throttling so
+        # suppressed duplicate alerts still advance the simulated per-user ladder.
+        await self._record_shadow_policy_simulation(
+            context=context,
+            decision=decision,
+            policy=policy,
+            shadow_mode=shadow_mode,
         )
 
         notified = False
@@ -1368,6 +1555,8 @@ class ModerationExecutor:
                 decision=decision,
                 policy=policy,
                 live_ban_enabled=live_ban_enabled,
+                core_decision=core_decision,
+                core_policy=core_policy,
             )
 
         elif (

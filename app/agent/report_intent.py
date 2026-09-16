@@ -24,6 +24,14 @@ class ReportIntentDecision(BaseModel):
     # direct threat toward another participant. This flag is semantic too.
     reporter_has_independent_violation: bool = False
 
+    # True only when the reply explicitly asks moderators/users to inspect,
+    # flag, warn about, or otherwise moderate the replied-to message.
+    # False means the classifier explicitly found NO such request.
+    # None is a backward-compatibility state for older structured payloads
+    # that predate this field; legacy report_target semantics are preserved
+    # instead of silently turning a valid mixed report into a non-report.
+    explicit_moderation_request: bool | None = None
+
     reason: str = Field(
         min_length=1,
         max_length=400,
@@ -61,32 +69,48 @@ Set reporter_has_independent_violation=true ONLY if the reply itself contains a
 separate direct violation, for example a direct threat, targeted severe abuse,
 or its own scam/spam solicitation.
 
+Set explicit_moderation_request=true ONLY when the CURRENT REPLY itself clearly
+asks moderators/users/bot to inspect, flag, warn about, or take moderation
+action on the REPLIED-TO MESSAGE. A direct insult or threat toward the reply
+target is NOT an explicit moderation request.
+
 Examples:
 "это похоже на скам, проверьте" -> report_target=true,
-reporter_has_independent_violation=false
+reporter_has_independent_violation=false, explicit_moderation_request=true
 
 "не кликайте, выглядит мутно" -> report_target=true,
-reporter_has_independent_violation=false
+reporter_has_independent_violation=false, explicit_moderation_request=true
 
 "проверьте сообщение выше, а автора я найду и убью" -> report_target=true,
-reporter_has_independent_violation=true
+reporter_has_independent_violation=true, explicit_moderation_request=true
 
-"ахах норм" -> report_target=false
+"ахах норм" -> report_target=false, explicit_moderation_request=false
 
 "ты тупой идиот, заткнись" -> report_target=false,
-reporter_has_independent_violation=true
+reporter_has_independent_violation=true, explicit_moderation_request=false
 
 "сам заткнись, ты тупой идиот" -> report_target=false,
-reporter_has_independent_violation=true
+reporter_has_independent_violation=true, explicit_moderation_request=false
 
-A direct insult aimed at the replied-to participant is an ordinary hostile reply,
-NOT a report merely because it refers to that participant.
+A direct insult or threat aimed at the replied-to participant is an ordinary
+hostile reply. It is NOT a report merely because it refers to that participant.
+It is also NOT a report merely because it is a Telegram reply. Example:
+"я тебя найду и разъебу, это не шутка" -> report_target=false,
+reporter_has_independent_violation=true, explicit_moderation_request=false.
 
 "Mods, please check this. This user keeps starting fights." -> report_target=true,
-reporter_has_independent_violation=false
+reporter_has_independent_violation=false, explicit_moderation_request=true
 
 "Модеры, посмотрите, он постоянно провоцирует срач." -> report_target=true,
-reporter_has_independent_violation=false
+reporter_has_independent_violation=false, explicit_moderation_request=true
+
+"админы проверьте это" -> report_target=true,
+reporter_has_independent_violation=false, explicit_moderation_request=true
+
+Short moderator-directed imperatives such as "admins check this", "mods look at
+this", or their equivalents in any language are reports when they are replies.
+They do not need to contain an explicit accusation. The object to review is the
+REPLIED-TO MESSAGE, not the report phrase itself.
 
 The report is only a request for a fresh independent review.
 It is never proof that the target is guilty.
