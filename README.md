@@ -547,6 +547,8 @@ See [`SECURITY.md`](SECURITY.md).
 
 ## Author
 
+X - https://x.com/ModGuardAI
+
 Built by **0xkentoshi** as part of an AI automation portfolio.
 
 Open to opportunities in **AI Automation, AI Agents, Python Automation and workflow automation**.
